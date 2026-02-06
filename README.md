@@ -183,6 +183,25 @@ Index search (the default mode) is **5.5x faster** — effectively instant at 18
 
 An earlier pure-Rust deep search (using `rayon` + `BufReader`) clocked in at **1,118ms** — 3x slower than Python+ripgrep. Ripgrep is purpose-built for this: SIMD string matching, memory-mapped I/O, and heavily optimized parallel file reading. Rather than reimplement ripgrep, we shell out to it and handle the structured post-processing in Rust.
 
+## Comparison with alternatives
+
+| Tool | Language | Search Method | Speed (deep) | Dependencies | Claude Code Skill | Notes |
+|------|----------|---------------|-------------|-------------|-------------------|-------|
+| **search-sessions** (this) | Rust + rg | Weighted index + ripgrep | **280 ms** | rg only | Yes (zero-config) | Hybrid architecture; instant index, sub-second deep |
+| [cc-conversation-search](https://github.com/nicobailey/cc-conversation-search) | Python | SQLite FTS5 | ~500 ms | Python, SQLite | No | Full-text index; requires initial indexing step |
+| [claude-history](https://github.com/4t2/claude-history) | Rust | Fuzzy matching (TUI) | ~400 ms | None | No | Interactive TUI with fuzzy finder; no CLI batch mode |
+| [aichat claude-code-tools](https://github.com/aichat/claude-code-tools) | Python + Rust | Tantivy FTS | ~300 ms | Python, Tantivy | No | Powerful full-text search; heavier install |
+| [cc-sessions-cli](https://github.com/AiRSpace/cc-sessions-cli) | Python | Simple grep | ~2 s | Python | No | Basic; no ranking or snippets |
+| [claude-conversation-extractor](https://github.com/nicobailey/claude-conversation-extractor) | Python | Export only | N/A | Python | No | Export/convert tool, not a search tool |
+
+### Why this one?
+
+- **Zero config**: No indexing step, no database, no Python runtime. Build the binary, point the skill at it, done.
+- **Instant default mode**: Index search completes in 18 ms — fast enough that Claude Code can call it mid-conversation without the user noticing.
+- **Sub-second deep search**: Ripgrep does the heavy lifting with SIMD-accelerated matching across 1.6 GB of JSONL in 280 ms.
+- **Native Claude Code skill**: Designed from the start as a `/search-sessions` slash command, not a standalone app retrofitted with a wrapper.
+- **No external runtime**: Single static binary. No Python, no Node, no Docker.
+
 ## Python fallback
 
 A standalone Python version is included as `search-sessions.py`. It has identical functionality and output format, requires only the Python standard library (plus `rg` for deep search).
