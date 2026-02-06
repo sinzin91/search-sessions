@@ -1,10 +1,10 @@
 # search-sessions
 
-Search across all your Claude Code session history. Fast.
+Search across all your Claude Code **and OpenClaw** session history. Fast.
 
 ## What it does
 
-Claude Code stores session transcripts as JSONL files in `~/.claude/projects/`. This tool searches across **all** of them — metadata and full message content — so you can find past decisions, code snippets, and recover context from any previous session.
+Claude Code stores session transcripts as JSONL files in `~/.claude/projects/`. OpenClaw stores them in `~/.openclaw/agents/<agent>/sessions/`. This tool searches across **all** of them — metadata and full message content — so you can find past decisions, code snippets, and recover context from any previous session.
 
 ## Install
 
@@ -139,8 +139,78 @@ search-sessions "RBAC" --deep --project noc0
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--deep` | Search full message content (uses ripgrep) | off (index only) |
+| `--openclaw` | Search OpenClaw sessions instead of Claude Code | off |
+| `--agent NAME` | OpenClaw agent to search | main |
 | `--limit N` | Max results to display | 20 |
 | `--project FILTER` | Only search sessions from projects matching this substring | all projects |
+
+## OpenClaw Support
+
+Search across your OpenClaw agent session history with the `--openclaw` flag.
+
+### Setup
+
+OpenClaw stores sessions in `~/.openclaw/agents/<agent>/sessions/*.jsonl`. No additional setup needed — just use the `--openclaw` flag.
+
+### Usage
+
+```bash
+# Search OpenClaw sessions (always deep search — no index files)
+search-sessions "security audit" --openclaw
+
+# Limit results
+search-sessions "email" --openclaw --limit 5
+
+# Search a different agent (default is "main")
+search-sessions "query" --openclaw --agent other
+```
+
+### Example Output
+
+```
+============================================================
+  DEEP SEARCH (OPENCLAW): "security audit"
+  17 matches found
+============================================================
+
+  [1] [USER] (no summary)
+      Project:  ~/.openclaw/workspace
+      Date:     2026-02-03 17:00
+      Snippet:  ...daily-security-audit] Perform your daily security audit. Review: 1) All credentials and access you have...
+      Session:  329ca9d8-a90c-4c34-add7-d680c8c67937
+
+  [2] [ASST] (no summary)
+      Project:  ~/.openclaw/workspace
+      Date:     2026-02-03 17:01
+      Snippet:  🔐 **Daily Security Audit Complete** **2 findings:** 1. ⚠️ **fastmail.sh is malformed**...
+      Session:  329ca9d8-a90c-4c34-add7-d680c8c67937
+
+============================================================
+```
+
+### OpenClaw Session Format
+
+OpenClaw sessions differ from Claude Code:
+
+| Aspect | Claude Code | OpenClaw |
+|--------|-------------|----------|
+| Path | `~/.claude/projects/<project>/` | `~/.openclaw/agents/<agent>/sessions/` |
+| Index | `sessions-index.json` per project | None (deep search only) |
+| Message type | `"type": "user"` or `"assistant"` | `"type": "message"` with nested `role` |
+
+### Performance
+
+Tested on 14 sessions, 15 MB of JSONL data:
+
+- Specific queries: **~50 ms**
+- Common words: **~130 ms**
+
+### Use Cases
+
+1. **Recover context after compaction** — Find what you discussed before context was truncated
+2. **Cross-session memory** — Search decisions, code snippets, or ideas from any session
+3. **Audit trail** — "Did I ever mention that API key?" or "What did the security audit find?"
+4. **Find past conversations** — "What did we say about X?" across your entire history
 
 ## How it works
 
