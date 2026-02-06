@@ -97,6 +97,12 @@ struct SessionIndexEntry {
     project_path: String,
 }
 
+/// OpenClaw session metadata extracted from session header
+struct OpenClawSessionMeta {
+    cwd: String,
+    timestamp: String,
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────
 
 fn claude_projects_dir() -> PathBuf {
@@ -180,7 +186,7 @@ fn load_index(path: &Path) -> (String, Vec<SessionIndexEntry>) {
     (original_path, index.entries)
 }
 
-fn score_index_entry(entry: &SessionIndexEntry, query_terms: &[String]) -> (f64, String) {
+fn score_index_entry(entry: &SessionIndexEntry, query_terms: &[&str]) -> (f64, String) {
     let fields: &[(&str, &str, f64)] = &[
         ("summary", &entry.summary, 3.0),
         ("firstPrompt", &entry.first_prompt, 2.0),
@@ -220,7 +226,7 @@ fn search_index(
     project_filter: Option<&str>,
     base: &Path,
 ) -> Vec<IndexMatch> {
-    let query_terms: Vec<String> = query.split_whitespace().map(String::from).collect();
+    let query_terms: Vec<&str> = query.split_whitespace().collect();
     let mut matches = Vec::new();
 
     for index_path in find_all_index_files(base) {
@@ -442,6 +448,59 @@ fn session_id_from_path(path: &Path) -> String {
         .to_string()
 }
 
+/// Pre-load OpenClaw session metadata by reading session headers from all JSONL files
+fn load_openclaw_session_metadata(base: &Path) -> HashMap<String, OpenClawSessionMeta> {
+    let mut metadata = HashMap::new();
+    
+    let Ok(entries) = fs::read_dir(base) else {
+        return metadata;
+    };
+    
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().map_or(false, |e| e == "jsonl") {
+            continue;
+        }
+        // Skip deleted sessions
+        if path.to_string_lossy().contains(".deleted.") {
+            continue;
+        }
+        
+        let session_id = session_id_from_path(&path);
+        if session_id.is_empty() {
+            continue;
+        }
+        
+        // Read first line to get session header
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Some(first_line) = content.lines().next() {
+                if let Ok(record) = serde_json::from_str::<serde_json::Value>(first_line) {
+                    if record.get("type").and_then(|t| t.as_str()) == Some("session") {
+                        let cwd = record
+                            .get("cwd")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let timestamp = record
+                            .get("timestamp")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        metadata.insert(session_id, OpenClawSessionMeta { cwd, timestamp });
+                    }
+                }
+            }
+        }
+    }
+    
+    metadata
+}
+
+/// Check if all query terms appear in the lowercased text
+fn matches_all_terms(text_lower: &str, query_terms_lower: &[String]) -> bool {
+    query_terms_lower.iter().all(|term| text_lower.contains(term))
+}
+
 fn search_deep_claude(
     query: &str,
     limit: usize,
@@ -449,7 +508,11 @@ fn search_deep_claude(
     base: &Path,
 ) -> Vec<DeepMatch> {
     let search_path = resolve_search_path(base, project_filter);
-    let query_terms: Vec<String> = query.split_whitespace().map(String::from).collect();
+    // Pre-lowercase query terms to avoid repeated allocations
+    let query_terms_lower: Vec<String> = query
+        .split_whitespace()
+        .map(|s| s.to_lowercase())
+        .collect();
     let index_lookup = build_index_lookup(base);
 
     let output = Command::new("rg")
@@ -457,8 +520,6 @@ fn search_deep_claude(
             "--no-heading",
             "--line-number",
             "--ignore-case",
-            "--max-count",
-            "5",
             "--glob",
             "*.jsonl",
             "--glob",
@@ -481,6 +542,11 @@ fn search_deep_claude(
             return vec![];
         }
     };
+
+    // rg returns exit code 1 for no matches, which is fine
+    if !output.status.success() && output.status.code() != Some(1) {
+        eprintln!("WARNING: ripgrep returned unexpected exit code: {:?}", output.status.code());
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -522,17 +588,13 @@ fn search_deep_claude(
             continue;
         }
 
-        // Verify ALL query terms appear in extracted text (AND semantics)
+        // Lowercase text once, then check all terms
         let text_lower = text.to_lowercase();
-        if !query_terms
-            .iter()
-            .all(|term| text_lower.contains(&term.to_lowercase()))
-        {
+        if !matches_all_terms(&text_lower, &query_terms_lower) {
             continue;
         }
 
-        let query_joined = query_terms.join(" ");
-        let snippet = get_snippet(&text, &query_joined, 80);
+        let snippet = get_snippet(&text, query, 80);
 
         let index_entry = index_lookup.get(&session_id);
         let project_path = record
@@ -570,15 +632,20 @@ fn search_deep_openclaw(
     limit: usize,
     base: &Path,
 ) -> Vec<DeepMatch> {
-    let query_terms: Vec<String> = query.split_whitespace().map(String::from).collect();
+    // Pre-lowercase query terms to avoid repeated allocations
+    let query_terms_lower: Vec<String> = query
+        .split_whitespace()
+        .map(|s| s.to_lowercase())
+        .collect();
+
+    // Pre-load session metadata before searching
+    let session_metadata = load_openclaw_session_metadata(base);
 
     let output = Command::new("rg")
         .args([
             "--no-heading",
             "--line-number",
             "--ignore-case",
-            "--max-count",
-            "10",
             "--glob",
             "*.jsonl",
             "--glob",
@@ -600,13 +667,15 @@ fn search_deep_openclaw(
         }
     };
 
+    // rg returns exit code 1 for no matches, which is fine
+    if !output.status.success() && output.status.code() != Some(1) {
+        eprintln!("WARNING: ripgrep returned unexpected exit code: {:?}", output.status.code());
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut matches = Vec::new();
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
-
-    // Build a map of session metadata from session records
-    let mut session_metadata: HashMap<String, (String, String)> = HashMap::new();
 
     for line in stdout.lines() {
         if matches.len() >= limit {
@@ -623,28 +692,12 @@ fn search_deep_openclaw(
             .and_then(|t| t.as_str())
             .unwrap_or("");
 
-        let session_id = session_id_from_path(&path);
-
-        // Cache session metadata
-        if record_type == "session" {
-            let cwd = record
-                .get("cwd")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let timestamp = record
-                .get("timestamp")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            session_metadata.insert(session_id.clone(), (cwd, timestamp));
-            continue;
-        }
-
-        // Only process message records
+        // Only process message records (skip session headers, tool calls, etc.)
         if record_type != "message" {
             continue;
         }
+
+        let session_id = session_id_from_path(&path);
 
         let count = seen_sessions.entry(session_id.clone()).or_insert(0);
         if *count >= MAX_MATCHES_PER_SESSION {
@@ -656,31 +709,28 @@ fn search_deep_openclaw(
             continue;
         }
 
-        // Verify ALL query terms appear in extracted text (AND semantics)
+        // Lowercase text once, then check all terms
         let text_lower = text.to_lowercase();
-        if !query_terms
-            .iter()
-            .all(|term| text_lower.contains(&term.to_lowercase()))
-        {
+        if !matches_all_terms(&text_lower, &query_terms_lower) {
             continue;
         }
 
-        let query_joined = query_terms.join(" ");
-        let snippet = get_snippet(&text, &query_joined, 80);
+        let snippet = get_snippet(&text, query, 80);
 
+        // Get timestamp from message, fall back to session metadata
         let timestamp = record
             .get("timestamp")
             .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Get cwd from message or session metadata
-        let project_path = record
-            .get("message")
-            .and_then(|m| m.get("cwd"))
-            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
             .map(String::from)
-            .or_else(|| session_metadata.get(&session_id).map(|(cwd, _)| cwd.clone()))
+            .or_else(|| session_metadata.get(&session_id).map(|m| m.timestamp.clone()))
+            .unwrap_or_default();
+
+        // Get cwd from session metadata (pre-loaded)
+        let project_path = session_metadata
+            .get(&session_id)
+            .map(|m| m.cwd.clone())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown".to_string());
 
         matches.push(DeepMatch {
