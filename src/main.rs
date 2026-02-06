@@ -469,11 +469,11 @@ fn search_deep(
             continue;
         }
 
-        // Verify query terms appear in extracted text
+        // Verify ALL query terms appear in extracted text (AND semantics)
         let text_lower = text.to_lowercase();
         if !query_terms
             .iter()
-            .any(|term| text_lower.contains(&term.to_lowercase()))
+            .all(|term| text_lower.contains(&term.to_lowercase()))
         {
             continue;
         }
