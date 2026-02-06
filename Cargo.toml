@@ -2,6 +2,11 @@
 name = "search-sessions"
 version = "0.1.0"
 edition = "2024"
+description = "Fast CLI to search across Claude Code and OpenClaw session history"
+license = "MIT"
+repository = "https://github.com/sinzin91/search-sessions"
+keywords = ["claude", "openclaw", "search", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -11,7 +16,19 @@ dirs = "6"
 glob = "0.3"
 chrono = "0.4"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "search_benchmark"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true
 strip = true
+
+[profile.bench]
+opt-level = 3
+lto = true
