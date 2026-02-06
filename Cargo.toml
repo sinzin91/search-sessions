@@ -1,0 +1,17 @@
+[package]
+name = "search-sessions"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+glob = "0.3"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
