@@ -16,7 +16,7 @@ const MAX_MATCHES_PER_SESSION: usize = 2;
 // ─── CLI ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "search-sessions", about = "Search Claude Code session history")]
+#[command(name = "search-sessions", about = "Search Claude Code or OpenClaw session history")]
 struct Cli {
     /// Search query (words are ANDed together)
     query: Vec<String>,
@@ -25,6 +25,10 @@ struct Cli {
     #[arg(long)]
     deep: bool,
 
+    /// Search OpenClaw sessions instead of Claude Code
+    #[arg(long)]
+    openclaw: bool,
+
     /// Maximum results to show
     #[arg(long, default_value_t = DEFAULT_LIMIT)]
     limit: usize,
@@ -32,6 +36,10 @@ struct Cli {
     /// Filter to sessions from projects matching this substring
     #[arg(long)]
     project: Option<String>,
+
+    /// OpenClaw agent to search (default: main)
+    #[arg(long, default_value = "main")]
+    agent: String,
 }
 
 // ─── Data Structures ────────────────────────────────────────────────
@@ -91,11 +99,20 @@ struct SessionIndexEntry {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-fn projects_dir() -> PathBuf {
+fn claude_projects_dir() -> PathBuf {
     dirs::home_dir()
         .expect("Cannot determine home directory")
         .join(".claude")
         .join("projects")
+}
+
+fn openclaw_sessions_dir(agent: &str) -> PathBuf {
+    dirs::home_dir()
+        .expect("Cannot determine home directory")
+        .join(".openclaw")
+        .join("agents")
+        .join(agent)
+        .join("sessions")
 }
 
 fn format_date(iso_str: &str) -> String {
@@ -132,7 +149,7 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-// ─── Index Search ───────────────────────────────────────────────────
+// ─── Index Search (Claude Code only) ────────────────────────────────
 
 fn find_all_index_files(base: &Path) -> Vec<PathBuf> {
     let pattern = format!("{}/*/sessions-index.json", base.display());
@@ -270,7 +287,9 @@ fn resolve_search_path(base: &Path, project_filter: Option<&str>) -> PathBuf {
     base.to_path_buf()
 }
 
-fn extract_text_from_message(value: &serde_json::Value) -> String {
+/// Extract text from Claude Code message format
+/// Record has: {"type": "user"|"assistant", "message": {"content": ...}}
+fn extract_text_claude(value: &serde_json::Value) -> String {
     let Some(message) = value.get("message") else {
         return String::new();
     };
@@ -278,6 +297,31 @@ fn extract_text_from_message(value: &serde_json::Value) -> String {
         return String::new();
     };
 
+    extract_content_array(content)
+}
+
+/// Extract text from OpenClaw message format
+/// Record has: {"type": "message", "message": {"role": "user"|"assistant", "content": ...}}
+fn extract_text_openclaw(value: &serde_json::Value) -> (String, String) {
+    let Some(message) = value.get("message") else {
+        return (String::new(), String::new());
+    };
+    
+    let role = message
+        .get("role")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    
+    let Some(content) = message.get("content") else {
+        return (role, String::new());
+    };
+
+    (role, extract_content_array(content))
+}
+
+/// Shared content array extraction
+fn extract_content_array(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => {
@@ -379,16 +423,26 @@ fn build_index_lookup(base: &Path) -> HashMap<String, SessionIndexEntry> {
 }
 
 /// Parse a single ripgrep output line: /path/to/file.jsonl:LINE_NUM:json_content
-fn parse_rg_line(line: &str) -> Option<serde_json::Value> {
+fn parse_rg_line(line: &str) -> Option<(PathBuf, serde_json::Value)> {
     // Split on first two colons
     let first_colon = line.find(':')?;
+    let path = PathBuf::from(&line[..first_colon]);
     let rest = &line[first_colon + 1..];
     let second_colon = rest.find(':')?;
     let json_str = &rest[second_colon + 1..];
-    serde_json::from_str(json_str).ok()
+    let value = serde_json::from_str(json_str).ok()?;
+    Some((path, value))
 }
 
-fn search_deep(
+/// Extract session ID from file path (OpenClaw: filename is session ID)
+fn session_id_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn search_deep_claude(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
@@ -428,7 +482,6 @@ fn search_deep(
         }
     };
 
-    // rg returns exit code 1 for no matches, which is fine
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut matches = Vec::new();
@@ -439,7 +492,7 @@ fn search_deep(
             break;
         }
 
-        let record = match parse_rg_line(line) {
+        let (_path, record) = match parse_rg_line(line) {
             Some(r) => r,
             None => continue,
         };
@@ -464,7 +517,7 @@ fn search_deep(
             continue;
         }
 
-        let text = extract_text_from_message(&record);
+        let text = extract_text_claude(&record);
         if text.is_empty() {
             continue;
         }
@@ -504,6 +557,140 @@ fn search_deep(
             timestamp,
             summary: index_entry.map(|e| e.summary.clone()),
             first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+        });
+
+        *count += 1;
+    }
+
+    matches
+}
+
+fn search_deep_openclaw(
+    query: &str,
+    limit: usize,
+    base: &Path,
+) -> Vec<DeepMatch> {
+    let query_terms: Vec<String> = query.split_whitespace().map(String::from).collect();
+
+    let output = Command::new("rg")
+        .args([
+            "--no-heading",
+            "--line-number",
+            "--ignore-case",
+            "--max-count",
+            "10",
+            "--glob",
+            "*.jsonl",
+            "--glob",
+            "!*.deleted.*",
+            query,
+        ])
+        .arg(base)
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("ERROR: ripgrep (rg) not found. Install it: brew install ripgrep");
+                std::process::exit(1);
+            }
+            eprintln!("ERROR: Failed to run ripgrep: {e}");
+            return vec![];
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut matches = Vec::new();
+    let mut seen_sessions: HashMap<String, usize> = HashMap::new();
+
+    // Build a map of session metadata from session records
+    let mut session_metadata: HashMap<String, (String, String)> = HashMap::new();
+
+    for line in stdout.lines() {
+        if matches.len() >= limit {
+            break;
+        }
+
+        let (path, record) = match parse_rg_line(line) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let record_type = record
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+
+        let session_id = session_id_from_path(&path);
+
+        // Cache session metadata
+        if record_type == "session" {
+            let cwd = record
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timestamp = record
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            session_metadata.insert(session_id.clone(), (cwd, timestamp));
+            continue;
+        }
+
+        // Only process message records
+        if record_type != "message" {
+            continue;
+        }
+
+        let count = seen_sessions.entry(session_id.clone()).or_insert(0);
+        if *count >= MAX_MATCHES_PER_SESSION {
+            continue;
+        }
+
+        let (role, text) = extract_text_openclaw(&record);
+        if text.is_empty() || (role != "user" && role != "assistant") {
+            continue;
+        }
+
+        // Verify ALL query terms appear in extracted text (AND semantics)
+        let text_lower = text.to_lowercase();
+        if !query_terms
+            .iter()
+            .all(|term| text_lower.contains(&term.to_lowercase()))
+        {
+            continue;
+        }
+
+        let query_joined = query_terms.join(" ");
+        let snippet = get_snippet(&text, &query_joined, 80);
+
+        let timestamp = record
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Get cwd from message or session metadata
+        let project_path = record
+            .get("message")
+            .and_then(|m| m.get("cwd"))
+            .and_then(|c| c.as_str())
+            .map(String::from)
+            .or_else(|| session_metadata.get(&session_id).map(|(cwd, _)| cwd.clone()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        matches.push(DeepMatch {
+            session_id: session_id.clone(),
+            project_path,
+            message_type: role,
+            snippet,
+            timestamp,
+            summary: None,
+            first_prompt: None,
         });
 
         *count += 1;
@@ -569,13 +756,14 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
     println!("{sep}\n");
 }
 
-fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize) {
+fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openclaw: bool) {
     let total = matches.len();
     let displayed = &matches[..total.min(limit)];
 
     let sep = "=".repeat(60);
+    let source = if is_openclaw { "OPENCLAW" } else { "CLAUDE CODE" };
     println!("\n{sep}");
-    println!("  DEEP SEARCH: \"{query}\"");
+    println!("  DEEP SEARCH ({source}): \"{query}\"");
     if total > limit {
         println!("  {total} matches found (showing top {limit})");
     } else {
@@ -584,8 +772,7 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize) {
     println!("{sep}\n");
 
     if displayed.is_empty() {
-        println!("  No matches found in session message content.");
-        println!("  Tip: Try without --deep to search metadata only.\n");
+        println!("  No matches found in session message content.\n");
         return;
     }
 
@@ -628,22 +815,44 @@ fn main() {
         std::process::exit(1);
     }
 
-    let base = projects_dir();
-    if !base.exists() {
-        eprintln!(
-            "ERROR: Claude projects directory not found: {}",
-            base.display()
-        );
-        std::process::exit(1);
-    }
+    if cli.openclaw {
+        // OpenClaw mode
+        let base = openclaw_sessions_dir(&cli.agent);
+        if !base.exists() {
+            eprintln!(
+                "ERROR: OpenClaw sessions directory not found: {}",
+                base.display()
+            );
+            eprintln!("       Make sure OpenClaw is installed and has session history.");
+            std::process::exit(1);
+        }
 
-    let project_filter = cli.project.as_deref();
+        // OpenClaw only supports deep search (no index files)
+        if !cli.deep {
+            eprintln!("NOTE: OpenClaw mode uses deep search by default (no index files).");
+        }
 
-    if cli.deep {
-        let matches = search_deep(&query, cli.limit, project_filter, &base);
-        print_deep_results(&matches, &query, cli.limit);
+        let matches = search_deep_openclaw(&query, cli.limit, &base);
+        print_deep_results(&matches, &query, cli.limit, true);
     } else {
-        let matches = search_index(&query, project_filter, &base);
-        print_index_results(&matches, &query, cli.limit);
+        // Claude Code mode
+        let base = claude_projects_dir();
+        if !base.exists() {
+            eprintln!(
+                "ERROR: Claude projects directory not found: {}",
+                base.display()
+            );
+            std::process::exit(1);
+        }
+
+        let project_filter = cli.project.as_deref();
+
+        if cli.deep {
+            let matches = search_deep_claude(&query, cli.limit, project_filter, &base);
+            print_deep_results(&matches, &query, cli.limit, false);
+        } else {
+            let matches = search_index(&query, project_filter, &base);
+            print_index_results(&matches, &query, cli.limit);
+        }
     }
 }
