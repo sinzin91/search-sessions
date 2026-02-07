@@ -3,7 +3,9 @@
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (for building)
-- [ripgrep](https://github.com/BurntSushi/ripgrep) (`brew install ripgrep`) — used for deep search
+- [ripgrep](https://github.com/BurntSushi/ripgrep) (optional) — 3-5x faster deep search
+
+> **Note:** Deep search works without ripgrep using a pure Rust fallback. Install ripgrep for best performance: `brew install ripgrep`
 
 ## Build from source
 

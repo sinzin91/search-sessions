@@ -56,9 +56,12 @@ Tested on 514 sessions, 1.6 GB of JSONL:
 | Mode | Time |
 |------|------|
 | Index search | **18 ms** |
-| Deep search | **280 ms** |
+| Deep search (with ripgrep) | **280 ms** |
+| Deep search (Rust fallback) | **~1 s** |
 
-Index search hits session metadata (summaries, first prompts). Deep search greps the actual message content via ripgrep.
+Index search hits session metadata (summaries, first prompts). Deep search greps the actual message content.
+
+**No dependencies required.** Deep search works out of the box with a pure Rust fallback. Install [ripgrep](https://github.com/BurntSushi/ripgrep) for 3-5x faster deep search.
 
 ## Built for Claude, not around it
 
@@ -70,9 +73,9 @@ No commands to memorize. No context switching. Claude finds it, shows you the re
 
 ## Comparison
 
-| Tool | Speed | Setup | Native to Claude |
-|------|-------|-------|------------------|
-| **search-sessions** | 280ms | `cargo build` | ✅ Slash command |
+| Tool | Speed | Dependencies | Native to Claude |
+|------|-------|--------------|------------------|
+| **search-sessions** | 280ms | **None** (rg optional) | ✅ Slash command |
 | cc-conversation-search | ~500ms | Python + SQLite | ❌ Separate CLI |
 | claude-history | ~400ms | Rust | ❌ TUI only |
 | aichat claude-code-tools | ~300ms | Python + Tantivy | ❌ Separate CLI |
