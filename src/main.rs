@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use chrono::{DateTime, FixedOffset};
 use clap::Parser;
@@ -16,7 +18,10 @@ const MAX_MATCHES_PER_SESSION: usize = 2;
 // ─── CLI ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "search-sessions", about = "Search Claude Code or OpenClaw session history")]
+#[command(
+    name = "search-sessions",
+    about = "Search Claude Code or OpenClaw session history"
+)]
 struct Cli {
     /// Search query (words are ANDed together)
     query: Vec<String>,
@@ -178,7 +183,12 @@ fn load_index(path: &Path) -> (String, Vec<SessionIndexEntry>) {
     };
     let original_path = if index.original_path.is_empty() {
         path.parent()
-            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
             .unwrap_or_default()
     } else {
         index.original_path
@@ -221,21 +231,19 @@ fn score_index_entry(entry: &SessionIndexEntry, query_terms: &[&str]) -> (f64, S
     (total_score, best_field)
 }
 
-fn search_index(
-    query: &str,
-    project_filter: Option<&str>,
-    base: &Path,
-) -> Vec<IndexMatch> {
+fn search_index(query: &str, project_filter: Option<&str>, base: &Path) -> Vec<IndexMatch> {
     let query_terms: Vec<&str> = query.split_whitespace().collect();
     let mut matches = Vec::new();
 
     for index_path in find_all_index_files(base) {
         let (original_path, entries) = load_index(&index_path);
 
-        if let Some(filter) = project_filter {
-            if !original_path.to_lowercase().contains(&filter.to_lowercase()) {
-                continue;
-            }
+        if let Some(filter) = project_filter
+            && !original_path
+                .to_lowercase()
+                .contains(&filter.to_lowercase())
+        {
+            continue;
         }
 
         for entry in &entries {
@@ -312,13 +320,13 @@ fn extract_text_openclaw(value: &serde_json::Value) -> (String, String) {
     let Some(message) = value.get("message") else {
         return (String::new(), String::new());
     };
-    
+
     let role = message
         .get("role")
         .and_then(|r| r.as_str())
         .unwrap_or("")
         .to_string();
-    
+
     let Some(content) = message.get("content") else {
         return (role, String::new());
     };
@@ -451,54 +459,320 @@ fn session_id_from_path(path: &Path) -> String {
 /// Pre-load OpenClaw session metadata by reading session headers from all JSONL files
 fn load_openclaw_session_metadata(base: &Path) -> HashMap<String, OpenClawSessionMeta> {
     let mut metadata = HashMap::new();
-    
+
     let Ok(entries) = fs::read_dir(base) else {
         return metadata;
     };
-    
+
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().map_or(false, |e| e == "jsonl") {
+        if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
         // Skip deleted sessions
         if path.to_string_lossy().contains(".deleted.") {
             continue;
         }
-        
+
         let session_id = session_id_from_path(&path);
         if session_id.is_empty() {
             continue;
         }
-        
+
         // Read first line to get session header
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Some(first_line) = content.lines().next() {
-                if let Ok(record) = serde_json::from_str::<serde_json::Value>(first_line) {
-                    if record.get("type").and_then(|t| t.as_str()) == Some("session") {
-                        let cwd = record
-                            .get("cwd")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let timestamp = record
-                            .get("timestamp")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        metadata.insert(session_id, OpenClawSessionMeta { cwd, timestamp });
-                    }
-                }
-            }
+        if let Ok(content) = fs::read_to_string(&path)
+            && let Some(first_line) = content.lines().next()
+            && let Ok(record) = serde_json::from_str::<serde_json::Value>(first_line)
+            && record.get("type").and_then(|t| t.as_str()) == Some("session")
+        {
+            let cwd = record
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timestamp = record
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            metadata.insert(session_id, OpenClawSessionMeta { cwd, timestamp });
         }
     }
-    
+
     metadata
 }
 
 /// Check if all query terms appear in the lowercased text
 fn matches_all_terms(text_lower: &str, query_terms_lower: &[String]) -> bool {
-    query_terms_lower.iter().all(|term| text_lower.contains(term))
+    query_terms_lower
+        .iter()
+        .all(|term| text_lower.contains(term))
+}
+
+// ─── Ripgrep Detection & Fallback ───────────────────────────────────
+
+/// Cache for ripgrep availability check
+static RIPGREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Check if ripgrep (rg) is available in PATH
+fn is_ripgrep_available() -> bool {
+    *RIPGREP_AVAILABLE.get_or_init(|| {
+        Command::new("rg")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Print a one-time warning about ripgrep not being available
+static RIPGREP_WARNING_SHOWN: OnceLock<()> = OnceLock::new();
+
+fn warn_ripgrep_not_available() {
+    RIPGREP_WARNING_SHOWN.get_or_init(|| {
+        eprintln!("WARNING: ripgrep (rg) not found. Using slower Rust fallback.");
+        eprintln!("         Install ripgrep for 3-5x faster deep search: brew install ripgrep");
+        eprintln!();
+    });
+}
+
+/// Find all JSONL files in a directory tree
+fn find_jsonl_files(base: &Path, exclude_subagents: bool, exclude_deleted: bool) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    fn walk_dir(
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+        exclude_subagents: bool,
+        exclude_deleted: bool,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Use file_type() to avoid following symlinks (matches ripgrep behavior)
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            // Skip symlinks entirely to avoid loops
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                // Skip subagents directory if requested
+                if exclude_subagents && path.file_name().is_some_and(|n| n == "subagents") {
+                    continue;
+                }
+                walk_dir(&path, files, exclude_subagents, exclude_deleted);
+            } else if file_type.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                // Skip deleted files if requested
+                if exclude_deleted && path.to_string_lossy().contains(".deleted.") {
+                    continue;
+                }
+                // Skip sessions-index.json (though it shouldn't have .jsonl extension)
+                if path.file_name().is_some_and(|n| n == "sessions-index.json") {
+                    continue;
+                }
+                files.push(path);
+            }
+        }
+    }
+
+    walk_dir(base, &mut files, exclude_subagents, exclude_deleted);
+    files
+}
+
+/// Pure Rust deep search for Claude Code sessions (fallback when ripgrep unavailable)
+fn search_deep_claude_rust(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+    base: &Path,
+) -> Vec<DeepMatch> {
+    warn_ripgrep_not_available();
+
+    let search_path = resolve_search_path(base, project_filter);
+    let query_terms_lower: Vec<String> =
+        query.split_whitespace().map(|s| s.to_lowercase()).collect();
+    let index_lookup = build_index_lookup(base);
+
+    let jsonl_files = find_jsonl_files(&search_path, true, false);
+
+    let mut matches = Vec::new();
+    let mut seen_sessions: HashMap<String, usize> = HashMap::new();
+
+    'outer: for file_path in jsonl_files {
+        let Ok(file) = File::open(&file_path) else {
+            continue;
+        };
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            if matches.len() >= limit {
+                break 'outer;
+            }
+
+            let Ok(line) = line else {
+                continue;
+            };
+
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+
+            let record_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if record_type != "user" && record_type != "assistant" {
+                continue;
+            }
+
+            let session_id = record
+                .get("sessionId")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let count = seen_sessions.entry(session_id.clone()).or_insert(0);
+            if *count >= MAX_MATCHES_PER_SESSION {
+                continue;
+            }
+
+            let text = extract_text_claude(&record);
+            if text.is_empty() {
+                continue;
+            }
+
+            let text_lower = text.to_lowercase();
+            if !matches_all_terms(&text_lower, &query_terms_lower) {
+                continue;
+            }
+
+            let snippet = get_snippet(&text, query, 80);
+
+            let index_entry = index_lookup.get(&session_id);
+            let project_path = record
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .or_else(|| index_entry.map(|e| e.project_path.clone()))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let timestamp = record
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            matches.push(DeepMatch {
+                session_id: session_id.clone(),
+                project_path,
+                message_type: record_type.to_string(),
+                snippet,
+                timestamp,
+                summary: index_entry.map(|e| e.summary.clone()),
+                first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+            });
+
+            *count += 1;
+        }
+    }
+
+    matches
+}
+
+/// Pure Rust deep search for OpenClaw sessions (fallback when ripgrep unavailable)
+fn search_deep_openclaw_rust(query: &str, limit: usize, base: &Path) -> Vec<DeepMatch> {
+    warn_ripgrep_not_available();
+
+    let query_terms_lower: Vec<String> =
+        query.split_whitespace().map(|s| s.to_lowercase()).collect();
+    let session_metadata = load_openclaw_session_metadata(base);
+
+    let jsonl_files = find_jsonl_files(base, false, true);
+
+    let mut matches = Vec::new();
+    let mut seen_sessions: HashMap<String, usize> = HashMap::new();
+
+    'outer: for file_path in jsonl_files {
+        let Ok(file) = File::open(&file_path) else {
+            continue;
+        };
+        let reader = BufReader::new(file);
+        let session_id = session_id_from_path(&file_path);
+
+        for line in reader.lines() {
+            if matches.len() >= limit {
+                break 'outer;
+            }
+
+            let Ok(line) = line else {
+                continue;
+            };
+
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+
+            let record_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if record_type != "message" {
+                continue;
+            }
+
+            let count = seen_sessions.entry(session_id.clone()).or_insert(0);
+            if *count >= MAX_MATCHES_PER_SESSION {
+                continue;
+            }
+
+            let (role, text) = extract_text_openclaw(&record);
+            if text.is_empty() || (role != "user" && role != "assistant") {
+                continue;
+            }
+
+            let text_lower = text.to_lowercase();
+            if !matches_all_terms(&text_lower, &query_terms_lower) {
+                continue;
+            }
+
+            let snippet = get_snippet(&text, query, 80);
+
+            let timestamp = record
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .or_else(|| {
+                    session_metadata
+                        .get(&session_id)
+                        .map(|m| m.timestamp.clone())
+                })
+                .unwrap_or_default();
+
+            let project_path = session_metadata
+                .get(&session_id)
+                .map(|m| m.cwd.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            matches.push(DeepMatch {
+                session_id: session_id.clone(),
+                project_path,
+                message_type: role,
+                snippet,
+                timestamp,
+                summary: None,
+                first_prompt: None,
+            });
+
+            *count += 1;
+        }
+    }
+
+    matches
 }
 
 fn search_deep_claude(
@@ -507,12 +781,15 @@ fn search_deep_claude(
     project_filter: Option<&str>,
     base: &Path,
 ) -> Vec<DeepMatch> {
+    // Check if ripgrep is available, fall back to pure Rust if not
+    if !is_ripgrep_available() {
+        return search_deep_claude_rust(query, limit, project_filter, base);
+    }
+
     let search_path = resolve_search_path(base, project_filter);
     // Pre-lowercase query terms to avoid repeated allocations
-    let query_terms_lower: Vec<String> = query
-        .split_whitespace()
-        .map(|s| s.to_lowercase())
-        .collect();
+    let query_terms_lower: Vec<String> =
+        query.split_whitespace().map(|s| s.to_lowercase()).collect();
     let index_lookup = build_index_lookup(base);
 
     let output = Command::new("rg")
@@ -534,18 +811,18 @@ fn search_deep_claude(
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                eprintln!("ERROR: ripgrep (rg) not found. Install it: brew install ripgrep");
-                std::process::exit(1);
-            }
-            eprintln!("ERROR: Failed to run ripgrep: {e}");
-            return vec![];
+            // Fallback to Rust if ripgrep fails unexpectedly
+            eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
+            return search_deep_claude_rust(query, limit, project_filter, base);
         }
     };
 
     // rg returns exit code 1 for no matches, which is fine
     if !output.status.success() && output.status.code() != Some(1) {
-        eprintln!("WARNING: ripgrep returned unexpected exit code: {:?}", output.status.code());
+        eprintln!(
+            "WARNING: ripgrep returned unexpected exit code: {:?}",
+            output.status.code()
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -563,10 +840,7 @@ fn search_deep_claude(
             None => continue,
         };
 
-        let record_type = record
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let record_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         if record_type != "user" && record_type != "assistant" {
             continue;
@@ -627,16 +901,15 @@ fn search_deep_claude(
     matches
 }
 
-fn search_deep_openclaw(
-    query: &str,
-    limit: usize,
-    base: &Path,
-) -> Vec<DeepMatch> {
+fn search_deep_openclaw(query: &str, limit: usize, base: &Path) -> Vec<DeepMatch> {
+    // Check if ripgrep is available, fall back to pure Rust if not
+    if !is_ripgrep_available() {
+        return search_deep_openclaw_rust(query, limit, base);
+    }
+
     // Pre-lowercase query terms to avoid repeated allocations
-    let query_terms_lower: Vec<String> = query
-        .split_whitespace()
-        .map(|s| s.to_lowercase())
-        .collect();
+    let query_terms_lower: Vec<String> =
+        query.split_whitespace().map(|s| s.to_lowercase()).collect();
 
     // Pre-load session metadata before searching
     let session_metadata = load_openclaw_session_metadata(base);
@@ -658,18 +931,18 @@ fn search_deep_openclaw(
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                eprintln!("ERROR: ripgrep (rg) not found. Install it: brew install ripgrep");
-                std::process::exit(1);
-            }
-            eprintln!("ERROR: Failed to run ripgrep: {e}");
-            return vec![];
+            // Fallback to Rust if ripgrep fails unexpectedly
+            eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
+            return search_deep_openclaw_rust(query, limit, base);
         }
     };
 
     // rg returns exit code 1 for no matches, which is fine
     if !output.status.success() && output.status.code() != Some(1) {
-        eprintln!("WARNING: ripgrep returned unexpected exit code: {:?}", output.status.code());
+        eprintln!(
+            "WARNING: ripgrep returned unexpected exit code: {:?}",
+            output.status.code()
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -687,10 +960,7 @@ fn search_deep_openclaw(
             None => continue,
         };
 
-        let record_type = record
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let record_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         // Only process message records (skip session headers, tool calls, etc.)
         if record_type != "message" {
@@ -723,7 +993,11 @@ fn search_deep_openclaw(
             .and_then(|t| t.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from)
-            .or_else(|| session_metadata.get(&session_id).map(|m| m.timestamp.clone()))
+            .or_else(|| {
+                session_metadata
+                    .get(&session_id)
+                    .map(|m| m.timestamp.clone())
+            })
             .unwrap_or_default();
 
         // Get cwd from session metadata (pre-loaded)
@@ -811,7 +1085,11 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
     let displayed = &matches[..total.min(limit)];
 
     let sep = "=".repeat(60);
-    let source = if is_openclaw { "OPENCLAW" } else { "CLAUDE CODE" };
+    let source = if is_openclaw {
+        "OPENCLAW"
+    } else {
+        "CLAUDE CODE"
+    };
     println!("\n{sep}");
     println!("  DEEP SEARCH ({source}): \"{query}\"");
     if total > limit {

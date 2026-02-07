@@ -1,0 +1,25 @@
+{
+  "originalPath": "/home/user/projects/test",
+  "entries": [
+    {
+      "sessionId": "test-session-1",
+      "firstPrompt": "How do I set up RBAC in Kubernetes?",
+      "summary": "Discussing Kubernetes RBAC configuration",
+      "messageCount": 4,
+      "created": "2026-02-01T10:00:00Z",
+      "modified": "2026-02-01T10:01:30Z",
+      "gitBranch": "main",
+      "projectPath": "/home/user/projects/test"
+    },
+    {
+      "sessionId": "test-session-2",
+      "firstPrompt": "Help me debug this Docker compose file",
+      "summary": "Docker compose debugging session",
+      "messageCount": 6,
+      "created": "2026-02-02T14:00:00Z",
+      "modified": "2026-02-02T14:30:00Z",
+      "gitBranch": "feature/docker",
+      "projectPath": "/home/user/projects/test"
+    }
+  ]
+}
