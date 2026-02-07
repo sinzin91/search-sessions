@@ -236,13 +236,12 @@ fn search_index(query: &str, project_filter: Option<&str>, base: &Path) -> Vec<I
     for index_path in find_all_index_files(base) {
         let (original_path, entries) = load_index(&index_path);
 
-        if let Some(filter) = project_filter {
-            if !original_path
+        if let Some(filter) = project_filter
+            && !original_path
                 .to_lowercase()
                 .contains(&filter.to_lowercase())
-            {
-                continue;
-            }
+        {
+            continue;
         }
 
         for entry in &entries {
@@ -465,7 +464,7 @@ fn load_openclaw_session_metadata(base: &Path) -> HashMap<String, OpenClawSessio
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().map_or(false, |e| e == "jsonl") {
+        if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
         // Skip deleted sessions
@@ -479,24 +478,22 @@ fn load_openclaw_session_metadata(base: &Path) -> HashMap<String, OpenClawSessio
         }
 
         // Read first line to get session header
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Some(first_line) = content.lines().next() {
-                if let Ok(record) = serde_json::from_str::<serde_json::Value>(first_line) {
-                    if record.get("type").and_then(|t| t.as_str()) == Some("session") {
-                        let cwd = record
-                            .get("cwd")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let timestamp = record
-                            .get("timestamp")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        metadata.insert(session_id, OpenClawSessionMeta { cwd, timestamp });
-                    }
-                }
-            }
+        if let Ok(content) = fs::read_to_string(&path)
+            && let Some(first_line) = content.lines().next()
+            && let Ok(record) = serde_json::from_str::<serde_json::Value>(first_line)
+            && record.get("type").and_then(|t| t.as_str()) == Some("session")
+        {
+            let cwd = record
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timestamp = record
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            metadata.insert(session_id, OpenClawSessionMeta { cwd, timestamp });
         }
     }
 
