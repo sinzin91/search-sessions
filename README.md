@@ -49,15 +49,23 @@ Tested on 514 sessions, 1.6 GB of JSONL:
 
 Index search hits session metadata (summaries, first prompts). Deep search greps the actual message content via ripgrep.
 
+## Built for Claude, not around it
+
+Other tools give you a separate TUI or CLI to learn. This one works *inside* Claude — just ask your agent:
+
+> "search my sessions for that kubernetes RBAC discussion"
+
+No commands to memorize. No context switching. Claude finds it, shows you the result, and can resume the session if you want.
+
 ## Comparison
 
-| Tool | Speed | Setup | Notes |
-|------|-------|-------|-------|
-| **search-sessions** | 280ms | `cargo build` | Zero config, single binary |
-| cc-conversation-search | ~500ms | Python + SQLite | Requires indexing step |
-| claude-history | ~400ms | Rust | TUI only, no CLI mode |
-| aichat claude-code-tools | ~300ms | Python + Tantivy | Heavier install |
-| cc-sessions-cli | ~2s | Python | Basic, no ranking |
+| Tool | Speed | Setup | Native to Claude |
+|------|-------|-------|------------------|
+| **search-sessions** | 280ms | `cargo build` | ✅ Slash command |
+| cc-conversation-search | ~500ms | Python + SQLite | ❌ Separate CLI |
+| claude-history | ~400ms | Rust | ❌ TUI only |
+| aichat claude-code-tools | ~300ms | Python + Tantivy | ❌ Separate CLI |
+| cc-sessions-cli | ~2s | Python | ❌ Separate CLI |
 
 ## Use as Claude Code Skill
 
