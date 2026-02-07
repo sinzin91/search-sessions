@@ -27,6 +27,17 @@ Each result includes the session UUID — so you can find *and resume* any past 
 
 ## Quick Start
 
+Paste this into Claude Code:
+
+```
+Clone https://github.com/sinzin91/search-sessions, build it with cargo, 
+and set it up as a /search-sessions slash command I can use.
+```
+
+That's it. Claude handles the rest.
+
+## Manual Install
+
 ```bash
 # Install
 git clone https://github.com/sinzin91/search-sessions
