@@ -20,18 +20,20 @@ Claude Code stores session data in `~/.claude/projects/`:
 
 ## Search architecture
 
-**Index search** (Rust-native): 
+**Index search** (pure Rust): 
 - Reads all `sessions-index.json` files
 - Scores entries with weighted AND-matching (summary 3x, firstPrompt 2x, branch/path 1x)
 - Sorts by score then recency
+- **18ms** on 514 sessions
 
-**Deep search** (Rust + ripgrep): 
-- Invokes `rg` for SIMD-accelerated string matching across all JSONL files
-- Parses matching lines in Rust to extract message text
+**Deep search** (Rust, optionally with ripgrep): 
+- If ripgrep is available: invokes `rg` for SIMD-accelerated matching (~280ms)
+- If not: uses pure Rust file scanning fallback (~1s)
+- Parses matching lines to extract message text
 - Generates snippets and cross-references with index metadata
 
-## Why hybrid?
+## Why ripgrep (when available)?
 
-An earlier pure-Rust deep search (using `rayon` + `BufReader`) clocked in at **1,118ms** — 3x slower than Python+ripgrep. 
+Ripgrep is purpose-built for fast text search: SIMD string matching, memory-mapped I/O, and heavily optimized parallel file reading. 
 
-Ripgrep is purpose-built for this: SIMD string matching, memory-mapped I/O, and heavily optimized parallel file reading. Rather than reimplement ripgrep, we shell out to it and handle the structured post-processing in Rust.
+On 1.6GB of JSONL, ripgrep deep search runs in **280ms** vs **~1s** for the pure Rust fallback. But the fallback means **no external dependencies required** — it just works out of the box.
