@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"test-openclaw-1","timestamp":"2026-02-01T10:00:00Z","cwd":"/home/user/projects/myapp"}
+{"type":"message","id":"msg1","timestamp":"2026-02-01T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"How do I configure the security audit schedule?"}]}}
+{"type":"message","id":"msg2","timestamp":"2026-02-01T10:00:30Z","message":{"role":"assistant","content":[{"type":"text","text":"You can configure the security audit schedule using a cron job. The audit runs daily at 9 AM PST by default."}]}}
+{"type":"message","id":"msg3","timestamp":"2026-02-01T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"What does the security audit check?"}]}}
+{"type":"message","id":"msg4","timestamp":"2026-02-01T10:01:30Z","message":{"role":"assistant","content":[{"type":"text","text":"The security audit checks:\n1. Credential file permissions\n2. Exposed secrets in code\n3. Recent suspicious activity\n4. Policy compliance gaps"}]}}
