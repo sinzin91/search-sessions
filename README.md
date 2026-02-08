@@ -10,9 +10,7 @@
 [![skills.sh](https://img.shields.io/badge/skills.sh-available-blue)](https://skills.sh)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Search across all your Claude Code **and OpenClaw** session history. Fast.
-
-> Find anything from your Claude Code history. Instantly.
+Search across all your Claude Code and OpenClaw session history. Fast.
 
 ## Why?
 
