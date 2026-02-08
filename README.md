@@ -1,5 +1,9 @@
 # search-sessions
 
+[![CI](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml/badge.svg)](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sinzin91/search-sessions)](https://github.com/sinzin91/search-sessions/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Search across all your Claude Code **and OpenClaw** session history. Fast.
 
 ## What it does
