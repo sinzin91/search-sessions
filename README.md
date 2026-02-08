@@ -1,5 +1,9 @@
 # search-sessions
 
+<p align="center">
+  <img src="assets/header.png" alt="search-sessions" width="600">
+</p>
+
 [![CI](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml/badge.svg)](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/search-sessions.svg)](https://crates.io/crates/search-sessions)
 [![Release](https://img.shields.io/github/v/release/sinzin91/search-sessions)](https://github.com/sinzin91/search-sessions/releases)
