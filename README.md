@@ -1,8 +1,10 @@
 # search-sessions
 
-> Find anything from your Claude Code history. Instantly.
+[![CI](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml/badge.svg)](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/search-sessions.svg)](https://crates.io/crates/search-sessions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-![search-sessions demo](assets/demo.gif)
+> Find anything from your Claude Code history. Instantly.
 
 ## Why?
 
@@ -27,31 +29,42 @@ Each result includes the session UUID — so you can find *and resume* any past 
 
 ## Quick Start
 
-Paste this into Claude Code:
+**For Claude Code users** — paste this:
 
 ```
-Clone https://github.com/sinzin91/search-sessions, build it with cargo, 
-and set it up as a /search-sessions slash command I can use.
+Set up https://github.com/sinzin91/search-sessions as a /search-sessions skill.
 ```
 
-That's it. Claude handles the rest.
+Claude reads the docs and handles install + setup.
 
-## Manual Install
+## Install
 
 ```bash
-# Install
-git clone https://github.com/sinzin91/search-sessions
-cd search-sessions
-cargo build --release
+# Homebrew (macOS/Linux)
+brew install sinzin91/tap/search-sessions
 
-# Search
-./target/release/search-sessions "kubernetes RBAC"
-./target/release/search-sessions "docker compose" --deep
+# Cargo (Rust)
+cargo install search-sessions
+
+# From source
+git clone https://github.com/sinzin91/search-sessions
+cd search-sessions && cargo build --release
+```
+
+## Usage
+
+```bash
+# Index search (instant, searches metadata)
+search-sessions "kubernetes RBAC"
+
+# Deep search (searches full message content)
+search-sessions "docker compose" --deep
+
+# Filter by project
+search-sessions "auth" --project myapp
 ```
 
 ## Speed
-
-Tested on 514 sessions, 1.6 GB of JSONL:
 
 | Mode | Time |
 |------|------|
@@ -59,31 +72,24 @@ Tested on 514 sessions, 1.6 GB of JSONL:
 | Deep search (with ripgrep) | **280 ms** |
 | Deep search (Rust fallback) | **~1 s** |
 
-Index search hits session metadata (summaries, first prompts). Deep search greps the actual message content.
-
-**No dependencies required.** Deep search works out of the box with a pure Rust fallback. Install [ripgrep](https://github.com/BurntSushi/ripgrep) for 3-5x faster deep search.
+**No dependencies required.** Install [ripgrep](https://github.com/BurntSushi/ripgrep) for 3-5x faster deep search.
 
 ## Built for Claude, not around it
 
-Other tools give you a separate TUI or CLI to learn. This one works *inside* Claude — just ask your agent:
+Other tools give you a separate TUI or CLI to learn. This one works *inside* Claude — just ask:
 
 > "search my sessions for that kubernetes RBAC discussion"
 
-No commands to memorize. No context switching. Claude finds it, shows you the result, and can resume the session if you want.
+No commands to memorize. No context switching.
 
 ## Comparison
 
 | Tool | Speed | Dependencies | Native to Claude |
 |------|-------|--------------|------------------|
-| **search-sessions** | 280ms | **None** (rg optional) | ✅ Slash command |
-| cc-conversation-search | ~500ms | Python + SQLite | ❌ Separate CLI |
+| **search-sessions** | 280ms | **None** | ✅ Slash command |
+| cc-conversation-search | ~500ms | Python + SQLite | ❌ |
 | claude-history | ~400ms | Rust | ❌ TUI only |
-| aichat claude-code-tools | ~300ms | Python + Tantivy | ❌ Separate CLI |
-| cc-sessions-cli | ~2s | Python | ❌ Separate CLI |
-
-## Use as Claude Code Skill
-
-See [docs/claude-code-skill.md](docs/claude-code-skill.md) for `/search-sessions` slash command setup.
+| aichat claude-code-tools | ~300ms | Python + Tantivy | ❌ |
 
 ## OpenClaw Support
 
@@ -96,6 +102,7 @@ Also searches OpenClaw agent sessions with `--openclaw`. See [docs/openclaw.md](
 - [OpenClaw Support](docs/openclaw.md)
 - [Architecture](docs/architecture.md)
 - [Benchmarks](docs/benchmarks.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 
