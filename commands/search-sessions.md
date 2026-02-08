@@ -1,11 +1,17 @@
 ---
 description: "Search across all past Claude Code sessions by metadata or full message content"
-usage: '/search-sessions "query" [--deep] [--limit N] [--project FILTER]'
+usage: '/search-sessions "query" [--deep] [--limit N] [--project FILTER] [--openclaw] [--agent NAME]'
 ---
 
 # Search Sessions
 
 Search across all past Claude Code and OpenClaw session history.
+
+## Prerequisites
+
+The `search-sessions` binary must be installed and on PATH. Install via:
+- `brew install sinzin91/tap/search-sessions`
+- `cargo install search-sessions`
 
 ## Modes
 
