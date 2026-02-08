@@ -12,7 +12,7 @@ Claude Code forgets. After a few sessions, you've lost context — that clever r
 
 Your session history is still there, buried in `~/.claude/projects/`. But good luck finding anything in 1.6GB of JSONL files.
 
-**search-sessions** fixes that. One binary. No indexing step. Sub-second search across everything.
+**search-sessions** fixes that. One binary. No indexing step. No database. Sub-second search across everything.
 
 Each result includes the session UUID — so you can find *and resume* any past conversation:
 
@@ -52,6 +52,8 @@ cd search-sessions && cargo build --release
 ```
 
 ## Usage
+
+This is a tool meant to be used by your agent.
 
 ```bash
 # Index search (instant, searches metadata)
