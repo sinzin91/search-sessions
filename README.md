@@ -2,7 +2,10 @@
 
 [![CI](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml/badge.svg)](https://github.com/sinzin91/search-sessions/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/search-sessions.svg)](https://crates.io/crates/search-sessions)
+[![Release](https://img.shields.io/github/v/release/sinzin91/search-sessions)](https://github.com/sinzin91/search-sessions/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Search across all your Claude Code **and OpenClaw** session history. Fast.
 
 > Find anything from your Claude Code history. Instantly.
 
