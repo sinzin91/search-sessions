@@ -1,0 +1,9 @@
+{
+  "name": "search-sessions",
+  "version": "0.1.0",
+  "description": "Search across Claude Code and OpenClaw session history. Find past conversations, decisions, and code snippets instantly.",
+  "author": {
+    "name": "sinzin91",
+    "email": "sinzin91@users.noreply.github.com"
+  }
+}

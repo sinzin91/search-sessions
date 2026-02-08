@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "search-sessions",
+  "description": "Search across Claude Code and OpenClaw session history. Find past conversations, decisions, and code snippets instantly.",
+  "owner": {
+    "name": "sinzin91",
+    "email": "sinzin91@users.noreply.github.com"
+  },
+  "plugins": [
+    {
+      "name": "search-sessions",
+      "version": "0.1.0",
+      "description": "Search across Claude Code and OpenClaw session history",
+      "source": "./",
+      "category": "utilities"
+    }
+  ]
+}
