@@ -23,10 +23,10 @@ Your session history is still there, buried in `~/.claude/projects/`. But good l
 Each result includes the session UUID — so you can find *and resume* any past conversation:
 
 ```
-❯ search-sessions "beads-tracker"
+❯ search-sessions "auth refactor"
 
-  [1] beads-tracker project exploration
-      Project:  ~/Projects/noc0/beads-tracker
+  [1] auth refactor discussion
+      Project:  ~/Projects/myapp
       Date:     2026-01-28 15:30
       Session:  7897c935-2069-4b75-bbad-a3fac62ea59c
 
