@@ -60,6 +60,12 @@ cd search-sessions && cargo build --release
 
 See [docs/install.md](docs/install.md) for detailed instructions.
 
+**Optional:** Want your agent to search history when asked "do you remember..."? Paste this:
+
+```
+Update your relevant files to use search-sessions when asked to remember or recall information.
+```
+
 ## Usage
 
 This is a tool meant to be used by your agent.
