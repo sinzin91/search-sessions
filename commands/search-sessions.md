@@ -36,7 +36,7 @@ The `search-sessions` binary must be installed and on PATH. Install via:
 /search-sessions "auth flow" --deep
 
 # Filter by project
-/search-sessions "billing" --project noc0
+/search-sessions "billing" --project myapp
 
 # Limit results
 /search-sessions "docker compose" --deep --limit 5
