@@ -36,14 +36,13 @@ Just copy-paste the `Resume` command to pick up where you left off.
 
 ## Quick Start
 
-### Claude Code Plugin (recommended)
+**For Claude Code users** — paste this into any session:
 
-```bash
-claude plugin marketplace add sinzin91/search-sessions
-claude plugin install search-sessions@search-sessions
+```
+Set up https://github.com/sinzin91/search-sessions as a /search-sessions skill.
 ```
 
-Then just ask Claude to search your sessions — no command to memorize.
+Claude reads the docs and handles install + setup. Then just ask to search your sessions.
 
 ### Manual Install
 
@@ -53,10 +52,6 @@ brew install sinzin91/tap/search-sessions
 
 # Cargo (Rust)
 cargo install search-sessions
-
-# From source
-git clone https://github.com/sinzin91/search-sessions
-cd search-sessions && cargo build --release
 ```
 
 See [docs/install.md](docs/install.md) for detailed instructions.
