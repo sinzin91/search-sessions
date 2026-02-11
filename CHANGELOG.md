@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-02-11
+
+### Added
+
+- **Copy-pasteable resume command**: Results now show `Resume: cd <dir> && claude -r <session-id>` for easy session resumption
+- **Claude Code plugin**: Native marketplace support with `claude plugin marketplace add sinzin91/search-sessions`
+- **SECURITY.md**: Vulnerability reporting via GitHub Security Advisories
+- **CONTRIBUTING.md**: Contribution guidelines (agent-friendly!)
+
+### Changed
+
+- Improved README with clearer installation instructions
+- Updated example output to show new Resume line
+
 ## [0.1.0] - 2026-02-08
 
 ### Added
@@ -24,4 +38,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Available via Homebrew: `brew install sinzin91/tap/search-sessions`
 - GitHub releases with pre-built binaries
 
+[0.1.1]: https://github.com/sinzin91/search-sessions/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sinzin91/search-sessions/releases/tag/v0.1.0

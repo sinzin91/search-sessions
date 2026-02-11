@@ -1,6 +1,6 @@
 [package]
 name = "search-sessions"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Fast CLI to search across Claude Code and OpenClaw session history"
 license = "MIT"
