@@ -29,9 +29,10 @@ Each result includes the session UUID — so you can find *and resume* any past 
       Project:  ~/Projects/myapp
       Date:     2026-01-28 15:30
       Session:  7897c935-2069-4b75-bbad-a3fac62ea59c
-
-❯ claude --resume 7897c935-2069-4b75-bbad-a3fac62ea59c
+      Resume:   cd ~/Projects/myapp && claude -r 7897c935-2069-4b75-bbad-a3fac62ea59c
 ```
+
+Just copy-paste the `Resume` command to pick up where you left off.
 
 ## Quick Start
 
