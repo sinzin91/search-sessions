@@ -42,7 +42,7 @@ claude plugin marketplace add sinzin91/search-sessions
 claude plugin install search-sessions@search-sessions
 ```
 
-Then use `/search-sessions "your query"` in any session.
+Then just ask Claude to search your sessions — no command to memorize.
 
 ### Manual Install
 
