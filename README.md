@@ -35,15 +35,16 @@ Each result includes the session UUID — so you can find *and resume* any past 
 
 ## Quick Start
 
-**For Claude Code users** — paste this:
+### Claude Code Plugin (recommended)
 
+```bash
+claude plugin marketplace add sinzin91/search-sessions
+claude plugin install search-sessions@search-sessions
 ```
-Set up https://github.com/sinzin91/search-sessions as a /search-sessions skill.
-```
 
-Claude reads the docs and handles install + setup.
+Then just ask Claude to search your sessions — no command to memorize.
 
-## Install
+### Manual Install
 
 ```bash
 # Homebrew (macOS/Linux)
@@ -56,6 +57,8 @@ cargo install search-sessions
 git clone https://github.com/sinzin91/search-sessions
 cd search-sessions && cargo build --release
 ```
+
+See [docs/install.md](docs/install.md) for detailed instructions.
 
 ## Usage
 
