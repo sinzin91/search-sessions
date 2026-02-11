@@ -35,7 +35,7 @@ Search across all past Claude Code session history.
 ```
 /search-sessions "kubernetes RBAC"
 /search-sessions "auth flow" --deep
-/search-sessions "billing" --project noc0
+/search-sessions "billing" --project myapp
 ```
 
 !~/.claude/bin/search-sessions/target/release/search-sessions {{$1}}
