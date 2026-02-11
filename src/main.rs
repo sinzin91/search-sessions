@@ -1072,6 +1072,11 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
             println!("      Prompt:   {preview}{suffix}");
         }
         println!("      Session:  {}", m.session_id);
+        // Print copy-pasteable resume command
+        println!(
+            "      Resume:   cd {} && claude -r {}",
+            project_short, m.session_id
+        );
         println!();
     }
 
@@ -1126,6 +1131,13 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
         let clean_snippet: String = m.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
         println!("      Snippet:  {clean_snippet}");
         println!("      Session:  {}", m.session_id);
+        // Print copy-pasteable resume command (Claude Code only, not OpenClaw)
+        if !is_openclaw && m.project_path != "unknown" {
+            println!(
+                "      Resume:   cd {} && claude -r {}",
+                project_short, m.session_id
+            );
+        }
         println!();
     }
 
