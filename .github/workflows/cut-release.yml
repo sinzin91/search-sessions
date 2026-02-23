@@ -61,10 +61,19 @@ jobs:
           echo "Updated Cargo.toml:"
           grep '^version' Cargo.toml
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Update Cargo.lock
+        run: cargo check
+
+      - name: Check tag does not exist
         run: |
-          rustup default stable
-          cargo update -p search-sessions
+          NEXT="v${{ steps.next.outputs.version }}"
+          if git rev-parse "$NEXT" >/dev/null 2>&1; then
+            echo "::error::Tag $NEXT already exists"
+            exit 1
+          fi
 
       - name: Commit & tag
         if: ${{ inputs.dry_run == false }}
@@ -72,7 +81,7 @@ jobs:
           git add Cargo.toml Cargo.lock
           git commit -m "release: v${{ steps.next.outputs.version }}"
           git tag "v${{ steps.next.outputs.version }}"
-          git push origin main --tags
+          git push origin ${{ github.ref_name }} --tags
 
       - name: Dry run summary
         if: ${{ inputs.dry_run == true }}
