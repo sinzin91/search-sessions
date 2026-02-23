@@ -1,0 +1,99 @@
+name: Cut Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: "Dry run (no tag push)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  cut-release:
+    name: Bump version & tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get current version
+        id: current
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current version: $VERSION"
+
+      - name: Compute next version
+        id: next
+        run: |
+          IFS='.' read -r major minor patch <<< "${{ steps.current.outputs.version }}"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          NEXT="${major}.${minor}.${patch}"
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT"
+
+      - name: Update Cargo.toml
+        run: |
+          sed -i "0,/^version = .*/s//version = \"${{ steps.next.outputs.version }}\"/" Cargo.toml
+          echo "Updated Cargo.toml:"
+          grep '^version' Cargo.toml
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Update Cargo.lock
+        run: cargo check
+
+      - name: Check tag does not exist
+        run: |
+          NEXT="v${{ steps.next.outputs.version }}"
+          if git rev-parse "$NEXT" >/dev/null 2>&1; then
+            echo "::error::Tag $NEXT already exists"
+            exit 1
+          fi
+
+      - name: Commit & tag
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: v${{ steps.next.outputs.version }}"
+          git tag "v${{ steps.next.outputs.version }}"
+          git push origin ${{ github.ref_name }} --tags
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "🏜️ Dry run — would have:"
+          echo "  - Bumped ${{ steps.current.outputs.version }} → ${{ steps.next.outputs.version }}"
+          echo "  - Tagged v${{ steps.next.outputs.version }}"
+          echo "  - Pushed to main"
+          git diff Cargo.toml
+
+      - name: Summary
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          echo "🚀 Released v${{ steps.next.outputs.version }}"
+          echo "The release build workflow will now run automatically."
