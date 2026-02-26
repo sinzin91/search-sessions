@@ -208,14 +208,18 @@ impl DateRange {
 
 /// Parse an ISO timestamp string into a UTC DateTime
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
-    // Try RFC 3339
+    // Try RFC 3339 directly
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.to_utc());
     }
-    // Try with Z normalization
-    let normalized = s.replace('Z', "+00:00");
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
-        return Some(dt.to_utc());
+    // Handle lowercase 'z' suffix (e.g. "2026-02-24T12:00:00z")
+    if s.ends_with('z') {
+        let mut fixed = s.to_string();
+        fixed.pop();
+        fixed.push('Z');
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&fixed) {
+            return Some(dt.to_utc());
+        }
     }
     None
 }
@@ -314,8 +318,15 @@ fn build_date_range(
     let until_dt = until
         .map(|u| {
             let dt = parse_human_date(u)?;
-            // --until is exclusive; if user says "until 2026-02-24", include that full day
-            Ok::<_, String>(dt + TimeDelta::days(1))
+            // If the user provided a full ISO timestamp (e.g. 2026-02-24T12:00:00Z),
+            // treat it as an exclusive upper bound as-is.
+            // If they provided a day-granularity input (keyword, YYYY-MM-DD, etc.),
+            // add +1 day so "until 2026-02-24" includes that full day.
+            if parse_timestamp(u.trim()).is_some() {
+                Ok::<_, String>(dt)
+            } else {
+                Ok::<_, String>(dt + TimeDelta::days(1))
+            }
         })
         .transpose()?;
 
