@@ -75,10 +75,119 @@ jobs:
             exit 1
           fi
 
+      - name: Update CHANGELOG.md
+        run: |
+          NEXT_VERSION="${{ steps.next.outputs.version }}"
+          CURRENT_VERSION="${{ steps.current.outputs.version }}"
+          TODAY=$(date -u +%Y-%m-%d)
+
+          # Find the last tag to get commit range
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Generate changelog entries from commits since last tag
+          # Group by conventional commit prefix
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="${LAST_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          # Collect entries by category
+          ADDED=""
+          CHANGED=""
+          FIXED=""
+          OTHER=""
+
+          while IFS= read -r line; do
+            # Skip release commits and merge commits
+            if echo "$line" | grep -qE "^(release:|Merge branch)"; then
+              continue
+            fi
+
+            # Categorize by conventional commit prefix
+            if echo "$line" | grep -qiE "^feat(\(|:)"; then
+              entry=$(echo "$line" | sed -E 's/^feat(\([^)]*\))?:\s*//')
+              ADDED="${ADDED}\n- ${entry}"
+            elif echo "$line" | grep -qiE "^fix(\(|:)"; then
+              entry=$(echo "$line" | sed -E 's/^fix(\([^)]*\))?:\s*//')
+              FIXED="${FIXED}\n- ${entry}"
+            elif echo "$line" | grep -qiE "^(refactor|perf|docs|ci|build|chore)(\(|:)"; then
+              entry=$(echo "$line" | sed -E 's/^[a-z]+(\([^)]*\))?:\s*//')
+              CHANGED="${CHANGED}\n- ${entry}"
+            else
+              # Non-conventional commits (e.g. merge commit subjects)
+              if echo "$line" | grep -qiE "^Merge pull request"; then
+                # Extract PR title from merge commits
+                entry=$(echo "$line" | sed -E 's/^Merge pull request #[0-9]+ from [^ ]+ //')
+                if [ -n "$entry" ] && [ "$entry" != "$line" ]; then
+                  OTHER="${OTHER}\n- ${entry}"
+                fi
+              fi
+            fi
+          done <<< "$(git log ${RANGE} --pretty=format:'%s' --no-merges 2>/dev/null; git log ${RANGE} --pretty=format:'%s' --merges 2>/dev/null)"
+
+          # Build the new entry
+          NEW_ENTRY="## [${NEXT_VERSION}] - ${TODAY}"
+
+          if [ -n "$ADDED" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n### Added\n${ADDED}"
+          fi
+          if [ -n "$CHANGED" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n### Changed\n${CHANGED}"
+          fi
+          if [ -n "$FIXED" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n### Fixed\n${FIXED}"
+          fi
+          if [ -n "$OTHER" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n### Other\n${OTHER}"
+          fi
+
+          # If no entries found, add a placeholder
+          if [ -z "$ADDED" ] && [ -z "$CHANGED" ] && [ -z "$FIXED" ] && [ -z "$OTHER" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n- See [release notes](https://github.com/sinzin91/search-sessions/releases/tag/v${NEXT_VERSION}) for details"
+          fi
+
+          # Add version comparison link
+          if [ -n "$LAST_TAG" ]; then
+            LINK="[${NEXT_VERSION}]: https://github.com/sinzin91/search-sessions/compare/${LAST_TAG}...v${NEXT_VERSION}"
+          else
+            LINK="[${NEXT_VERSION}]: https://github.com/sinzin91/search-sessions/releases/tag/v${NEXT_VERSION}"
+          fi
+
+          # Insert new entry after the header block (after the first ## or after preamble)
+          # Find line number of first "## [" entry
+          FIRST_ENTRY_LINE=$(grep -n "^## \[" CHANGELOG.md | head -1 | cut -d: -f1)
+
+          if [ -n "$FIRST_ENTRY_LINE" ]; then
+            # Insert before first existing entry
+            {
+              head -n $((FIRST_ENTRY_LINE - 1)) CHANGELOG.md
+              echo ""
+              echo -e "$NEW_ENTRY"
+              echo ""
+              tail -n +${FIRST_ENTRY_LINE} CHANGELOG.md
+            } > CHANGELOG.tmp
+          else
+            # No existing entries, append after header
+            {
+              cat CHANGELOG.md
+              echo ""
+              echo -e "$NEW_ENTRY"
+            } > CHANGELOG.tmp
+          fi
+
+          mv CHANGELOG.tmp CHANGELOG.md
+
+          # Append link at end of file (before any existing links or at EOF)
+          echo "$LINK" >> CHANGELOG.md
+
+          echo "Updated CHANGELOG.md:"
+          head -30 CHANGELOG.md
+
       - name: Commit & tag
         if: ${{ inputs.dry_run == false }}
         run: |
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "release: v${{ steps.next.outputs.version }}"
           git tag "v${{ steps.next.outputs.version }}"
           git push origin ${{ github.ref_name }} --tags
@@ -89,8 +198,14 @@ jobs:
           echo "🏜️ Dry run — would have:"
           echo "  - Bumped ${{ steps.current.outputs.version }} → ${{ steps.next.outputs.version }}"
           echo "  - Tagged v${{ steps.next.outputs.version }}"
+          echo "  - Updated CHANGELOG.md"
           echo "  - Pushed to main"
+          echo ""
+          echo "Cargo.toml diff:"
           git diff Cargo.toml
+          echo ""
+          echo "CHANGELOG.md diff:"
+          git diff CHANGELOG.md
 
       - name: Summary
         if: ${{ inputs.dry_run == false }}
