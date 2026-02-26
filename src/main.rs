@@ -220,62 +220,71 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+/// Map a unit string (singular) to a TimeDelta multiplier
+fn unit_to_delta(unit: &str, n: i64) -> Option<TimeDelta> {
+    match unit {
+        "day" => Some(TimeDelta::days(n)),
+        "week" => Some(TimeDelta::weeks(n)),
+        "month" => Some(TimeDelta::days(n * 30)),
+        _ => None,
+    }
+}
+
+/// Start-of-day UTC for a NaiveDate
+fn start_of_day(date: NaiveDate) -> DateTime<Utc> {
+    date.and_hms_opt(0, 0, 0).unwrap().and_utc()
+}
+
+/// Try to parse "N units ago" from a lowercased string
+fn try_parse_ago(s: &str, today: NaiveDate) -> Option<DateTime<Utc>> {
+    let rest = s.strip_suffix(" ago")?;
+    let mut parts = rest.split_whitespace();
+    let n: i64 = parts.next()?.parse().ok()?;
+    let unit = parts.next()?.trim_end_matches('s');
+    if parts.next().is_some() {
+        return None; // too many tokens
+    }
+    let delta = unit_to_delta(unit, n)?;
+    Some(start_of_day(today - delta))
+}
+
+/// Try to parse "last week" / "last month" from a lowercased string
+fn try_parse_last(s: &str, today: NaiveDate) -> Option<DateTime<Utc>> {
+    let unit = s.strip_prefix("last ")?.trim_end_matches('s');
+    let delta = unit_to_delta(unit, 1)?;
+    Some(start_of_day(today - delta))
+}
+
 /// Parse a human-friendly date string into a UTC DateTime (start of day)
 fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
     let trimmed = s.trim();
     let lower = trimmed.to_lowercase();
-    let now = Utc::now();
-    let today = now.date_naive();
+    let today = Utc::now().date_naive();
 
-    // Relative keywords
-    match lower.as_str() {
-        "today" | "now" => return Ok(today.and_hms_opt(0, 0, 0).unwrap().and_utc()),
-        "yesterday" => {
-            let d = today - TimeDelta::days(1);
-            return Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc());
-        }
-        _ => {}
+    // Exact keywords
+    if lower == "today" || lower == "now" {
+        return Ok(start_of_day(today));
+    }
+    if lower == "yesterday" {
+        return Ok(start_of_day(today - TimeDelta::days(1)));
     }
 
-    // "N days ago", "N weeks ago", "N months ago"
-    if lower.ends_with(" ago") {
-        let parts: Vec<&str> = lower.trim_end_matches(" ago").split_whitespace().collect();
-        if parts.len() == 2
-            && let Ok(n) = parts[0].parse::<i64>()
-        {
-            let delta = match parts[1].trim_end_matches('s') {
-                "day" => Some(TimeDelta::days(n)),
-                "week" => Some(TimeDelta::weeks(n)),
-                "month" => Some(TimeDelta::days(n * 30)),
-                _ => None,
-            };
-            if let Some(d) = delta {
-                let date = today - d;
-                return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
-            }
-        }
+    // "N days/weeks/months ago"
+    if let Some(dt) = try_parse_ago(&lower, today) {
+        return Ok(dt);
     }
 
-    // "last week", "last month"
-    if lower.starts_with("last ") {
-        let unit = lower.trim_start_matches("last ");
-        let delta = match unit.trim_end_matches('s') {
-            "week" => Some(TimeDelta::weeks(1)),
-            "month" => Some(TimeDelta::days(30)),
-            _ => None,
-        };
-        if let Some(d) = delta {
-            let date = today - d;
-            return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
-        }
+    // "last week" / "last month"
+    if let Some(dt) = try_parse_last(&lower, today) {
+        return Ok(dt);
     }
 
-    // Absolute date: YYYY-MM-DD (use original case-preserved string)
+    // Absolute YYYY-MM-DD
     if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+        return Ok(start_of_day(date));
     }
 
-    // Absolute ISO datetime (use original to preserve T/Z casing)
+    // Absolute ISO datetime (case-preserved for T/Z)
     if let Some(dt) = parse_timestamp(trimmed) {
         return Ok(dt);
     }
