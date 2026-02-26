@@ -188,15 +188,15 @@ impl DateRange {
         let Some(dt) = parse_timestamp(timestamp_str) else {
             return false; // Can't parse → exclude when filtering by date
         };
-        if let Some(ref since) = self.since {
-            if dt < *since {
-                return false;
-            }
+        if let Some(ref since) = self.since
+            && dt < *since
+        {
+            return false;
         }
-        if let Some(ref until) = self.until {
-            if dt >= *until {
-                return false;
-            }
+        if let Some(ref until) = self.until
+            && dt >= *until
+        {
+            return false;
         }
         true
     }
@@ -240,18 +240,18 @@ fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
     // "N days ago", "N weeks ago", "N months ago"
     if lower.ends_with(" ago") {
         let parts: Vec<&str> = lower.trim_end_matches(" ago").split_whitespace().collect();
-        if parts.len() == 2 {
-            if let Ok(n) = parts[0].parse::<i64>() {
-                let delta = match parts[1].trim_end_matches('s') {
-                    "day" => Some(TimeDelta::days(n)),
-                    "week" => Some(TimeDelta::weeks(n)),
-                    "month" => Some(TimeDelta::days(n * 30)),
-                    _ => None,
-                };
-                if let Some(d) = delta {
-                    let date = today - d;
-                    return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
-                }
+        if parts.len() == 2
+            && let Ok(n) = parts[0].parse::<i64>()
+        {
+            let delta = match parts[1].trim_end_matches('s') {
+                "day" => Some(TimeDelta::days(n)),
+                "week" => Some(TimeDelta::weeks(n)),
+                "month" => Some(TimeDelta::days(n * 30)),
+                _ => None,
+            };
+            if let Some(d) = delta {
+                let date = today - d;
+                return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
             }
         }
     }
