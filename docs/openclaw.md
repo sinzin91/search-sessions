@@ -17,6 +17,10 @@ search-sessions "email" --openclaw --limit 5
 
 # Search a different agent (default is "main")
 search-sessions "query" --openclaw --agent other
+
+# Filter by date range (works with --openclaw too)
+search-sessions "deploy" --openclaw --since "yesterday"
+search-sessions "bug" --openclaw --date 2026-02-20
 ```
 
 ## Example Output
