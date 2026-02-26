@@ -259,38 +259,63 @@ fn try_parse_last(s: &str, today: NaiveDate) -> Option<DateTime<Utc>> {
     Some(start_of_day(today - delta))
 }
 
+/// Result of parsing a human date string.
+/// `date_only` is true when the input resolved to a whole day (not a precise time).
+struct ParsedDate {
+    dt: DateTime<Utc>,
+    date_only: bool,
+}
+
 /// Parse a human-friendly date string into a UTC DateTime (start of day)
-fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
+fn parse_human_date(s: &str) -> Result<ParsedDate, String> {
     let trimmed = s.trim();
     let lower = trimmed.to_lowercase();
     let today = Utc::now().date_naive();
 
-    // Exact keywords
+    // Exact keywords → date-only
     if lower == "today" || lower == "now" {
-        return Ok(start_of_day(today));
+        return Ok(ParsedDate {
+            dt: start_of_day(today),
+            date_only: true,
+        });
     }
     if lower == "yesterday" {
-        return Ok(start_of_day(today - TimeDelta::days(1)));
+        return Ok(ParsedDate {
+            dt: start_of_day(today - TimeDelta::days(1)),
+            date_only: true,
+        });
     }
 
-    // "N days/weeks/months ago"
+    // "N days/weeks/months ago" → date-only
     if let Some(dt) = try_parse_ago(&lower, today) {
-        return Ok(dt);
+        return Ok(ParsedDate {
+            dt,
+            date_only: true,
+        });
     }
 
-    // "last week" / "last month"
+    // "last week" / "last month" → date-only
     if let Some(dt) = try_parse_last(&lower, today) {
-        return Ok(dt);
+        return Ok(ParsedDate {
+            dt,
+            date_only: true,
+        });
     }
 
-    // Absolute YYYY-MM-DD
+    // Absolute YYYY-MM-DD → date-only
     if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        return Ok(start_of_day(date));
+        return Ok(ParsedDate {
+            dt: start_of_day(date),
+            date_only: true,
+        });
     }
 
-    // Absolute ISO datetime (case-preserved for T/Z)
+    // Absolute ISO datetime → precise (NOT date-only)
     if let Some(dt) = parse_timestamp(trimmed) {
-        return Ok(dt);
+        return Ok(ParsedDate {
+            dt,
+            date_only: false,
+        });
     }
 
     Err(format!(
@@ -306,27 +331,28 @@ fn build_date_range(
 ) -> Result<DateRange, String> {
     if let Some(d) = date {
         // --date is shorthand for a single day
-        let start = parse_human_date(d)?;
-        let end = start + TimeDelta::days(1);
+        let parsed = parse_human_date(d)?;
+        let end = parsed.dt + TimeDelta::days(1);
         return Ok(DateRange {
-            since: Some(start),
+            since: Some(parsed.dt),
             until: Some(end),
         });
     }
 
-    let since_dt = since.map(parse_human_date).transpose()?;
+    let since_dt = since
+        .map(|s| parse_human_date(s).map(|p| p.dt))
+        .transpose()?;
     let until_dt = until
         .map(|u| {
-            let dt = parse_human_date(u)?;
-            // If the user provided a full ISO timestamp (e.g. 2026-02-24T12:00:00Z),
-            // treat it as an exclusive upper bound as-is.
-            // If they provided a day-granularity input (keyword, YYYY-MM-DD, etc.),
-            // add +1 day so "until 2026-02-24" includes that full day.
-            if parse_timestamp(u.trim()).is_some() {
-                Ok::<_, String>(dt)
+            let parsed = parse_human_date(u)?;
+            // For date-only inputs ("2026-02-24", "yesterday"), add 1 day to include the full day.
+            // For precise ISO datetimes ("2026-02-24T15:00:00Z"), use the exact time as-is.
+            let boundary = if parsed.date_only {
+                parsed.dt + TimeDelta::days(1)
             } else {
-                Ok::<_, String>(dt + TimeDelta::days(1))
-            }
+                parsed.dt
+            };
+            Ok::<_, String>(boundary)
         })
         .transpose()?;
 
