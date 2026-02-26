@@ -145,10 +145,14 @@ fn format_date(iso_str: &str) -> String {
     if let Ok(dt) = DateTime::parse_from_rfc3339(iso_str) {
         return dt.format("%Y-%m-%d %H:%M").to_string();
     }
-    // Try with Z suffix normalization
-    let normalized = iso_str.replace('Z', "+00:00");
-    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(&normalized) {
-        return dt.format("%Y-%m-%d %H:%M").to_string();
+    // Handle trailing lowercase 'z' only
+    if iso_str.ends_with('z') {
+        let mut fixed = iso_str.to_string();
+        fixed.pop();
+        fixed.push('Z');
+        if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(&fixed) {
+            return dt.format("%Y-%m-%d %H:%M").to_string();
+        }
     }
     // Fallback: return first 16 chars
     iso_str.chars().take(16).collect()
