@@ -75,10 +75,121 @@ jobs:
             exit 1
           fi
 
+      - name: Update CHANGELOG.md
+        run: |
+          set -euo pipefail
+
+          NEXT_VERSION="${{ steps.next.outputs.version }}"
+          TODAY=$(date -u +%Y-%m-%d)
+
+          # Ensure CHANGELOG.md exists
+          if [ ! -f CHANGELOG.md ]; then
+            cat > CHANGELOG.md << 'SCAFFOLD'
+          # Changelog
+
+          All notable changes to this project will be documented in this file.
+
+          The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+          and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+          SCAFFOLD
+          fi
+
+          # Find the last tag to get commit range
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Build git log args — omit range entirely if no previous tag (gets full history)
+          LOG_ARGS="--pretty=format:%s"
+          if [ -n "$LAST_TAG" ]; then
+            LOG_ARGS="${LAST_TAG}..HEAD ${LOG_ARGS}"
+          fi
+
+          # Single-pass commit collection, de-duped via sort -u
+          COMMITS=$(git log ${LOG_ARGS} 2>/dev/null | sort -u)
+
+          # Collect entries by category
+          ADDED=""
+          CHANGED=""
+          FIXED=""
+
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+
+            # Skip release commits and bare merge commits
+            if echo "$line" | grep -qE "^(release:|Merge (branch|pull request))"; then
+              continue
+            fi
+
+            # Categorize by conventional commit prefix
+            if echo "$line" | grep -qiE "^feat(\(|:)"; then
+              entry=$(echo "$line" | sed -E 's/^feat(\([^)]*\))?:\s*//')
+              ADDED="${ADDED}\n- ${entry}"
+            elif echo "$line" | grep -qiE "^fix(\(|:)"; then
+              entry=$(echo "$line" | sed -E 's/^fix(\([^)]*\))?:\s*//')
+              FIXED="${FIXED}\n- ${entry}"
+            elif echo "$line" | grep -qiE "^(refactor|perf|docs|ci|build|chore)(\(|:)"; then
+              entry=$(echo "$line" | sed -E 's/^[a-z]+(\([^)]*\))?:\s*//')
+              CHANGED="${CHANGED}\n- ${entry}"
+            fi
+          done <<< "$COMMITS"
+
+          # Build the new entry
+          NEW_ENTRY="## [${NEXT_VERSION}] - ${TODAY}"
+
+          if [ -n "$ADDED" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n### Added\n${ADDED}"
+          fi
+          if [ -n "$CHANGED" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n### Changed\n${CHANGED}"
+          fi
+          if [ -n "$FIXED" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n### Fixed\n${FIXED}"
+          fi
+
+          # If no entries found, add a placeholder
+          if [ -z "$ADDED" ] && [ -z "$CHANGED" ] && [ -z "$FIXED" ]; then
+            NEW_ENTRY="${NEW_ENTRY}\n\n- See [release notes](https://github.com/sinzin91/search-sessions/releases/tag/v${NEXT_VERSION}) for details"
+          fi
+
+          # Build version comparison link
+          if [ -n "$LAST_TAG" ]; then
+            LINK="[${NEXT_VERSION}]: https://github.com/sinzin91/search-sessions/compare/${LAST_TAG}...v${NEXT_VERSION}"
+          else
+            LINK="[${NEXT_VERSION}]: https://github.com/sinzin91/search-sessions/releases/tag/v${NEXT_VERSION}"
+          fi
+
+          # Insert new entry before first existing "## [" entry
+          FIRST_ENTRY_LINE=$(grep -n "^## \[" CHANGELOG.md | head -1 | cut -d: -f1 || echo "")
+
+          if [ -n "$FIRST_ENTRY_LINE" ]; then
+            {
+              head -n $((FIRST_ENTRY_LINE - 1)) CHANGELOG.md
+              echo ""
+              echo -e "$NEW_ENTRY"
+              echo ""
+              tail -n +${FIRST_ENTRY_LINE} CHANGELOG.md
+            } > CHANGELOG.tmp
+          else
+            {
+              cat CHANGELOG.md
+              echo ""
+              echo -e "$NEW_ENTRY"
+            } > CHANGELOG.tmp
+          fi
+
+          mv CHANGELOG.tmp CHANGELOG.md
+
+          # Idempotent link insertion: only add if not already present
+          if ! grep -qF "[${NEXT_VERSION}]:" CHANGELOG.md; then
+            echo "$LINK" >> CHANGELOG.md
+          fi
+
+          echo "Updated CHANGELOG.md:"
+          head -40 CHANGELOG.md
+
       - name: Commit & tag
         if: ${{ inputs.dry_run == false }}
         run: |
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "release: v${{ steps.next.outputs.version }}"
           git tag "v${{ steps.next.outputs.version }}"
           git push origin ${{ github.ref_name }} --tags
@@ -89,8 +200,14 @@ jobs:
           echo "🏜️ Dry run — would have:"
           echo "  - Bumped ${{ steps.current.outputs.version }} → ${{ steps.next.outputs.version }}"
           echo "  - Tagged v${{ steps.next.outputs.version }}"
+          echo "  - Updated CHANGELOG.md"
           echo "  - Pushed to main"
+          echo ""
+          echo "Cargo.toml diff:"
           git diff Cargo.toml
+          echo ""
+          echo "CHANGELOG.md diff:"
+          git diff CHANGELOG.md
 
       - name: Summary
         if: ${{ inputs.dry_run == false }}
