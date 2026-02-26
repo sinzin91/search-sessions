@@ -88,3 +88,75 @@ jobs:
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/SHA256SUMS.txt
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  update-homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download source tarball and compute SHA256
+        id: sha
+        run: |
+          curl -sL "https://github.com/sinzin91/search-sessions/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" -o source.tar.gz
+          SHA=$(sha256sum source.tar.gz | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $SHA"
+
+      - name: Update Homebrew formula
+        uses: actions/checkout@v4
+        with:
+          repository: sinzin91/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Write updated formula
+        run: |
+          cat > homebrew-tap/Formula/search-sessions.rb << 'FORMULA'
+          class SearchSessions < Formula
+            desc "Fast CLI to search across Claude Code and OpenClaw session history"
+            homepage "https://github.com/sinzin91/search-sessions"
+            url "https://github.com/sinzin91/search-sessions/archive/refs/tags/v${{ steps.version.outputs.version }}.tar.gz"
+            sha256 "${{ steps.sha.outputs.sha256 }}"
+            license "MIT"
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              assert_match "Search Claude Code", shell_output("#{bin}/search-sessions --help")
+            end
+          end
+          FORMULA
+
+      - name: Commit and push formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/search-sessions.rb
+          git commit -m "search-sessions ${{ steps.version.outputs.version }}"
+          git push
