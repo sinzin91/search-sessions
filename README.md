@@ -75,6 +75,12 @@ search-sessions "docker compose" --deep
 
 # Filter by project
 search-sessions "auth" --project myapp
+
+# Filter by date range
+search-sessions "deploy" --since "3 days ago"
+search-sessions "auth" --since 2026-02-01 --until 2026-02-15
+search-sessions "bug" --date today
+search-sessions "refactor" --since "last week"
 ```
 
 ## Speed

@@ -32,6 +32,21 @@ Claude Code stores session data in `~/.claude/projects/`:
 - Parses matching lines to extract message text
 - Generates snippets and cross-references with index metadata
 
+## Date range filtering
+
+The `--since`, `--until`, and `--date` flags filter results by session timestamp. Parsing is handled by `parse_human_date()` which accepts:
+
+- **Relative keywords**: `today`, `yesterday`
+- **Relative offsets**: `N days ago`, `N weeks ago`, `N months ago`
+- **Named ranges**: `last week`, `last month`
+- **Absolute dates**: `YYYY-MM-DD`, ISO 8601 timestamps
+
+All relative dates resolve to UTC start-of-day boundaries. The `--date` flag is shorthand for `--since <date> --until <date+1day>`.
+
+When `--until` receives a date-only value (not a precise timestamp), it automatically advances to the start of the *next* day so that the entire day is included.
+
+Date filtering applies to both index and deep search modes. Sessions whose timestamps can't be parsed are excluded when a date filter is active.
+
 ## Why ripgrep (when available)?
 
 Ripgrep is purpose-built for fast text search: SIMD string matching, memory-mapped I/O, and heavily optimized parallel file reading. 
