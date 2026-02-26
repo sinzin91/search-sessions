@@ -189,6 +189,107 @@ mod cli_integration {
     }
 }
 
+mod date_range_cli {
+    use super::*;
+
+    #[test]
+    fn test_help_shows_date_flags() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .arg("--help")
+            .output()
+            .expect("Failed to run binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("--since"), "Help should mention --since");
+        assert!(stdout.contains("--until"), "Help should mention --until");
+        assert!(stdout.contains("--date"), "Help should mention --date");
+    }
+
+    #[test]
+    fn test_invalid_date_error() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .args(["test", "--since", "not-a-date"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Cannot parse date"),
+            "Should show parse error, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn test_date_flag_accepted() {
+        ensure_binary_built();
+
+        // --date with a valid date should not error on date parsing
+        // (may error on missing sessions dir, which is fine)
+        let output = Command::new(binary_path())
+            .args(["test", "--date", "2026-02-01"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Cannot parse date"),
+            "Valid date should not cause parse error"
+        );
+    }
+
+    #[test]
+    fn test_relative_date_accepted() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .args(["test", "--since", "yesterday"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Cannot parse date"),
+            "Relative date 'yesterday' should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_days_ago_accepted() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .args(["test", "--since", "3 days ago"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Cannot parse date"),
+            "'3 days ago' should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_last_week_accepted() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .args(["test", "--since", "last week"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Cannot parse date"),
+            "'last week' should be accepted"
+        );
+    }
+}
+
 mod query_matching {
     use super::*;
 

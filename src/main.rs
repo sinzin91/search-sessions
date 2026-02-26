@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeDelta, Utc};
 use clap::Parser;
 use serde::Deserialize;
 
@@ -45,6 +45,18 @@ struct Cli {
     /// OpenClaw agent to search (default: main)
     #[arg(long, default_value = "main")]
     agent: String,
+
+    /// Filter results from this date/time (e.g. "today", "yesterday", "3 days ago", "last week", "2026-02-20")
+    #[arg(long)]
+    since: Option<String>,
+
+    /// Filter results until this date/time (e.g. "today", "yesterday", "2026-02-24")
+    #[arg(long)]
+    until: Option<String>,
+
+    /// Shorthand for --since <date> --until <date+1day> (e.g. "today", "2026-02-20")
+    #[arg(long)]
+    date: Option<String>,
 }
 
 // ─── Data Structures ────────────────────────────────────────────────
@@ -160,6 +172,147 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+// ─── Date Range Filtering ───────────────────────────────────────────
+
+#[derive(Clone)]
+struct DateRange {
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+}
+
+impl DateRange {
+    fn contains(&self, timestamp_str: &str) -> bool {
+        if self.since.is_none() && self.until.is_none() {
+            return true;
+        }
+        let Some(dt) = parse_timestamp(timestamp_str) else {
+            return false; // Can't parse → exclude when filtering by date
+        };
+        if let Some(ref since) = self.since {
+            if dt < *since {
+                return false;
+            }
+        }
+        if let Some(ref until) = self.until {
+            if dt >= *until {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn is_active(&self) -> bool {
+        self.since.is_some() || self.until.is_some()
+    }
+}
+
+/// Parse an ISO timestamp string into a UTC DateTime
+fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    // Try RFC 3339
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.to_utc());
+    }
+    // Try with Z normalization
+    let normalized = s.replace('Z', "+00:00");
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
+        return Some(dt.to_utc());
+    }
+    None
+}
+
+/// Parse a human-friendly date string into a UTC DateTime (start of day)
+fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
+    let s = s.trim().to_lowercase();
+    let now = Utc::now();
+    let today = now.date_naive();
+
+    // Relative keywords
+    match s.as_str() {
+        "today" | "now" => return Ok(today.and_hms_opt(0, 0, 0).unwrap().and_utc()),
+        "yesterday" => {
+            let d = today - TimeDelta::days(1);
+            return Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc());
+        }
+        _ => {}
+    }
+
+    // "N days ago", "N weeks ago", "N months ago"
+    if s.ends_with(" ago") {
+        let parts: Vec<&str> = s.trim_end_matches(" ago").split_whitespace().collect();
+        if parts.len() == 2 {
+            if let Ok(n) = parts[0].parse::<i64>() {
+                let delta = match parts[1].trim_end_matches('s') {
+                    "day" => Some(TimeDelta::days(n)),
+                    "week" => Some(TimeDelta::weeks(n)),
+                    "month" => Some(TimeDelta::days(n * 30)),
+                    _ => None,
+                };
+                if let Some(d) = delta {
+                    let date = today - d;
+                    return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+                }
+            }
+        }
+    }
+
+    // "last week", "last month"
+    if s.starts_with("last ") {
+        let unit = s.trim_start_matches("last ");
+        let delta = match unit.trim_end_matches('s') {
+            "week" => Some(TimeDelta::weeks(1)),
+            "month" => Some(TimeDelta::days(30)),
+            _ => None,
+        };
+        if let Some(d) = delta {
+            let date = today - d;
+            return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+        }
+    }
+
+    // Absolute date: YYYY-MM-DD
+    if let Ok(date) = NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
+        return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+    }
+
+    // Absolute ISO datetime
+    if let Some(dt) = parse_timestamp(&s) {
+        return Ok(dt);
+    }
+
+    Err(format!("Cannot parse date: '{s}'. Try: today, yesterday, 3 days ago, last week, or YYYY-MM-DD"))
+}
+
+/// Build a DateRange from CLI args
+fn build_date_range(
+    since: Option<&str>,
+    until: Option<&str>,
+    date: Option<&str>,
+) -> Result<DateRange, String> {
+    if let Some(d) = date {
+        // --date is shorthand for a single day
+        let start = parse_human_date(d)?;
+        let end = start + TimeDelta::days(1);
+        return Ok(DateRange {
+            since: Some(start),
+            until: Some(end),
+        });
+    }
+
+    let since_dt = since.map(parse_human_date).transpose()?;
+    let until_dt = until
+        .map(|u| {
+            let dt = parse_human_date(u)?;
+            // --until is exclusive; if user says "until 2026-02-24", include that full day
+            Ok::<_, String>(dt + TimeDelta::days(1))
+        })
+        .transpose()?;
+
+    Ok(DateRange {
+        since: since_dt,
+        until: until_dt,
+    })
+}
+
 // ─── Index Search (Claude Code only) ────────────────────────────────
 
 fn find_all_index_files(base: &Path) -> Vec<PathBuf> {
@@ -231,7 +384,7 @@ fn score_index_entry(entry: &SessionIndexEntry, query_terms: &[&str]) -> (f64, S
     (total_score, best_field)
 }
 
-fn search_index(query: &str, project_filter: Option<&str>, base: &Path) -> Vec<IndexMatch> {
+fn search_index(query: &str, project_filter: Option<&str>, base: &Path, date_range: &DateRange) -> Vec<IndexMatch> {
     let query_terms: Vec<&str> = query.split_whitespace().collect();
     let mut matches = Vec::new();
 
@@ -249,6 +402,14 @@ fn search_index(query: &str, project_filter: Option<&str>, base: &Path) -> Vec<I
         for entry in &entries {
             let (score, matched_field) = score_index_entry(entry, &query_terms);
             if score > 0.0 {
+                // Apply date range filter (check created or modified)
+                if date_range.is_active() {
+                    let in_range = date_range.contains(&entry.created)
+                        || date_range.contains(&entry.modified);
+                    if !in_range {
+                        continue;
+                    }
+                }
                 matches.push(IndexMatch {
                     session_id: entry.session_id.clone(),
                     project_path: if entry.project_path.is_empty() {
@@ -593,6 +754,7 @@ fn search_deep_claude_rust(
     limit: usize,
     project_filter: Option<&str>,
     base: &Path,
+    date_range: &DateRange,
 ) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
@@ -668,6 +830,10 @@ fn search_deep_claude_rust(
                 .unwrap_or("")
                 .to_string();
 
+            if !date_range.contains(&timestamp) {
+                continue;
+            }
+
             matches.push(DeepMatch {
                 session_id: session_id.clone(),
                 project_path,
@@ -686,7 +852,7 @@ fn search_deep_claude_rust(
 }
 
 /// Pure Rust deep search for OpenClaw sessions (fallback when ripgrep unavailable)
-fn search_deep_openclaw_rust(query: &str, limit: usize, base: &Path) -> Vec<DeepMatch> {
+fn search_deep_openclaw_rust(query: &str, limit: usize, base: &Path, date_range: &DateRange) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
     let query_terms_lower: Vec<String> =
@@ -758,6 +924,10 @@ fn search_deep_openclaw_rust(query: &str, limit: usize, base: &Path) -> Vec<Deep
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "unknown".to_string());
 
+            if !date_range.contains(&timestamp) {
+                continue;
+            }
+
             matches.push(DeepMatch {
                 session_id: session_id.clone(),
                 project_path,
@@ -780,10 +950,11 @@ fn search_deep_claude(
     limit: usize,
     project_filter: Option<&str>,
     base: &Path,
+    date_range: &DateRange,
 ) -> Vec<DeepMatch> {
     // Check if ripgrep is available, fall back to pure Rust if not
     if !is_ripgrep_available() {
-        return search_deep_claude_rust(query, limit, project_filter, base);
+        return search_deep_claude_rust(query, limit, project_filter, base, date_range);
     }
 
     let search_path = resolve_search_path(base, project_filter);
@@ -813,7 +984,7 @@ fn search_deep_claude(
         Err(e) => {
             // Fallback to Rust if ripgrep fails unexpectedly
             eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
-            return search_deep_claude_rust(query, limit, project_filter, base);
+            return search_deep_claude_rust(query, limit, project_filter, base, date_range);
         }
     };
 
@@ -885,6 +1056,10 @@ fn search_deep_claude(
             .unwrap_or("")
             .to_string();
 
+        if !date_range.contains(&timestamp) {
+            continue;
+        }
+
         matches.push(DeepMatch {
             session_id: session_id.clone(),
             project_path,
@@ -901,10 +1076,10 @@ fn search_deep_claude(
     matches
 }
 
-fn search_deep_openclaw(query: &str, limit: usize, base: &Path) -> Vec<DeepMatch> {
+fn search_deep_openclaw(query: &str, limit: usize, base: &Path, date_range: &DateRange) -> Vec<DeepMatch> {
     // Check if ripgrep is available, fall back to pure Rust if not
     if !is_ripgrep_available() {
-        return search_deep_openclaw_rust(query, limit, base);
+        return search_deep_openclaw_rust(query, limit, base, date_range);
     }
 
     // Pre-lowercase query terms to avoid repeated allocations
@@ -933,7 +1108,7 @@ fn search_deep_openclaw(query: &str, limit: usize, base: &Path) -> Vec<DeepMatch
         Err(e) => {
             // Fallback to Rust if ripgrep fails unexpectedly
             eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
-            return search_deep_openclaw_rust(query, limit, base);
+            return search_deep_openclaw_rust(query, limit, base, date_range);
         }
     };
 
@@ -999,6 +1174,10 @@ fn search_deep_openclaw(query: &str, limit: usize, base: &Path) -> Vec<DeepMatch
                     .map(|m| m.timestamp.clone())
             })
             .unwrap_or_default();
+
+        if !date_range.contains(&timestamp) {
+            continue;
+        }
 
         // Get cwd from session metadata (pre-loaded)
         let project_path = session_metadata
@@ -1155,6 +1334,19 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Build date range from CLI args
+    let date_range = match build_date_range(
+        cli.since.as_deref(),
+        cli.until.as_deref(),
+        cli.date.as_deref(),
+    ) {
+        Ok(dr) => dr,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+
     if cli.openclaw {
         // OpenClaw mode
         let base = openclaw_sessions_dir(&cli.agent);
@@ -1172,7 +1364,7 @@ fn main() {
             eprintln!("NOTE: OpenClaw mode uses deep search by default (no index files).");
         }
 
-        let matches = search_deep_openclaw(&query, cli.limit, &base);
+        let matches = search_deep_openclaw(&query, cli.limit, &base, &date_range);
         print_deep_results(&matches, &query, cli.limit, true);
     } else {
         // Claude Code mode
@@ -1188,10 +1380,10 @@ fn main() {
         let project_filter = cli.project.as_deref();
 
         if cli.deep {
-            let matches = search_deep_claude(&query, cli.limit, project_filter, &base);
+            let matches = search_deep_claude(&query, cli.limit, project_filter, &base, &date_range);
             print_deep_results(&matches, &query, cli.limit, false);
         } else {
-            let matches = search_index(&query, project_filter, &base);
+            let matches = search_index(&query, project_filter, &base, &date_range);
             print_index_results(&matches, &query, cli.limit);
         }
     }
