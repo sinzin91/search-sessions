@@ -222,12 +222,13 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
 
 /// Parse a human-friendly date string into a UTC DateTime (start of day)
 fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
-    let s = s.trim().to_lowercase();
+    let trimmed = s.trim();
+    let lower = trimmed.to_lowercase();
     let now = Utc::now();
     let today = now.date_naive();
 
     // Relative keywords
-    match s.as_str() {
+    match lower.as_str() {
         "today" | "now" => return Ok(today.and_hms_opt(0, 0, 0).unwrap().and_utc()),
         "yesterday" => {
             let d = today - TimeDelta::days(1);
@@ -237,8 +238,8 @@ fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
     }
 
     // "N days ago", "N weeks ago", "N months ago"
-    if s.ends_with(" ago") {
-        let parts: Vec<&str> = s.trim_end_matches(" ago").split_whitespace().collect();
+    if lower.ends_with(" ago") {
+        let parts: Vec<&str> = lower.trim_end_matches(" ago").split_whitespace().collect();
         if parts.len() == 2 {
             if let Ok(n) = parts[0].parse::<i64>() {
                 let delta = match parts[1].trim_end_matches('s') {
@@ -256,8 +257,8 @@ fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
     }
 
     // "last week", "last month"
-    if s.starts_with("last ") {
-        let unit = s.trim_start_matches("last ");
+    if lower.starts_with("last ") {
+        let unit = lower.trim_start_matches("last ");
         let delta = match unit.trim_end_matches('s') {
             "week" => Some(TimeDelta::weeks(1)),
             "month" => Some(TimeDelta::days(30)),
@@ -269,17 +270,19 @@ fn parse_human_date(s: &str) -> Result<DateTime<Utc>, String> {
         }
     }
 
-    // Absolute date: YYYY-MM-DD
-    if let Ok(date) = NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
+    // Absolute date: YYYY-MM-DD (use original case-preserved string)
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
         return Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
     }
 
-    // Absolute ISO datetime
-    if let Some(dt) = parse_timestamp(&s) {
+    // Absolute ISO datetime (use original to preserve T/Z casing)
+    if let Some(dt) = parse_timestamp(trimmed) {
         return Ok(dt);
     }
 
-    Err(format!("Cannot parse date: '{s}'. Try: today, yesterday, 3 days ago, last week, or YYYY-MM-DD"))
+    Err(format!(
+        "Cannot parse date: '{trimmed}'. Try: today, yesterday, 3 days ago, last week, or YYYY-MM-DD"
+    ))
 }
 
 /// Build a DateRange from CLI args
@@ -384,7 +387,12 @@ fn score_index_entry(entry: &SessionIndexEntry, query_terms: &[&str]) -> (f64, S
     (total_score, best_field)
 }
 
-fn search_index(query: &str, project_filter: Option<&str>, base: &Path, date_range: &DateRange) -> Vec<IndexMatch> {
+fn search_index(
+    query: &str,
+    project_filter: Option<&str>,
+    base: &Path,
+    date_range: &DateRange,
+) -> Vec<IndexMatch> {
     let query_terms: Vec<&str> = query.split_whitespace().collect();
     let mut matches = Vec::new();
 
@@ -404,8 +412,8 @@ fn search_index(query: &str, project_filter: Option<&str>, base: &Path, date_ran
             if score > 0.0 {
                 // Apply date range filter (check created or modified)
                 if date_range.is_active() {
-                    let in_range = date_range.contains(&entry.created)
-                        || date_range.contains(&entry.modified);
+                    let in_range =
+                        date_range.contains(&entry.created) || date_range.contains(&entry.modified);
                     if !in_range {
                         continue;
                     }
@@ -852,7 +860,12 @@ fn search_deep_claude_rust(
 }
 
 /// Pure Rust deep search for OpenClaw sessions (fallback when ripgrep unavailable)
-fn search_deep_openclaw_rust(query: &str, limit: usize, base: &Path, date_range: &DateRange) -> Vec<DeepMatch> {
+fn search_deep_openclaw_rust(
+    query: &str,
+    limit: usize,
+    base: &Path,
+    date_range: &DateRange,
+) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
     let query_terms_lower: Vec<String> =
@@ -1076,7 +1089,12 @@ fn search_deep_claude(
     matches
 }
 
-fn search_deep_openclaw(query: &str, limit: usize, base: &Path, date_range: &DateRange) -> Vec<DeepMatch> {
+fn search_deep_openclaw(
+    query: &str,
+    limit: usize,
+    base: &Path,
+    date_range: &DateRange,
+) -> Vec<DeepMatch> {
     // Check if ripgrep is available, fall back to pure Rust if not
     if !is_ripgrep_available() {
         return search_deep_openclaw_rust(query, limit, base, date_range);
