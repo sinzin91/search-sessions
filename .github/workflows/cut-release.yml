@@ -19,10 +19,11 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   cut-release:
-    name: Bump version & tag
+    name: Bump version & create release PR
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +56,18 @@ jobs:
           echo "version=$NEXT" >> "$GITHUB_OUTPUT"
           echo "Next version: $NEXT"
 
+      - name: Check tag does not exist
+        run: |
+          NEXT="v${{ steps.next.outputs.version }}"
+          if git rev-parse "$NEXT" >/dev/null 2>&1; then
+            echo "::error::Tag $NEXT already exists"
+            exit 1
+          fi
+
+      - name: Create release branch
+        run: |
+          git checkout -b release/v${{ steps.next.outputs.version }}
+
       - name: Update Cargo.toml
         run: |
           sed -i "0,/^version = .*/s//version = \"${{ steps.next.outputs.version }}\"/" Cargo.toml
@@ -67,14 +80,6 @@ jobs:
       - name: Update Cargo.lock
         run: cargo check
 
-      - name: Check tag does not exist
-        run: |
-          NEXT="v${{ steps.next.outputs.version }}"
-          if git rev-parse "$NEXT" >/dev/null 2>&1; then
-            echo "::error::Tag $NEXT already exists"
-            exit 1
-          fi
-
       - name: Update CHANGELOG.md
         run: |
           set -euo pipefail
@@ -82,7 +87,6 @@ jobs:
           NEXT_VERSION="${{ steps.next.outputs.version }}"
           TODAY=$(date -u +%Y-%m-%d)
 
-          # Ensure CHANGELOG.md exists
           if [ ! -f CHANGELOG.md ]; then
             cat > CHANGELOG.md << 'SCAFFOLD'
           # Changelog
@@ -94,32 +98,24 @@ jobs:
           SCAFFOLD
           fi
 
-          # Find the last tag to get commit range
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 
-          # Build git log args — omit range entirely if no previous tag (gets full history)
           LOG_ARGS="--pretty=format:%s"
           if [ -n "$LAST_TAG" ]; then
             LOG_ARGS="${LAST_TAG}..HEAD ${LOG_ARGS}"
           fi
 
-          # Single-pass commit collection, de-duped via sort -u
           COMMITS=$(git log ${LOG_ARGS} 2>/dev/null | sort -u)
 
-          # Collect entries by category
           ADDED=""
           CHANGED=""
           FIXED=""
 
           while IFS= read -r line; do
             [ -z "$line" ] && continue
-
-            # Skip release commits and bare merge commits
             if echo "$line" | grep -qE "^(release:|Merge (branch|pull request))"; then
               continue
             fi
-
-            # Categorize by conventional commit prefix
             if echo "$line" | grep -qiE "^feat(\(|:)"; then
               entry=$(echo "$line" | sed -E 's/^feat(\([^)]*\))?:\s*//')
               ADDED="${ADDED}\n- ${entry}"
@@ -132,7 +128,6 @@ jobs:
             fi
           done <<< "$COMMITS"
 
-          # Build the new entry
           NEW_ENTRY="## [${NEXT_VERSION}] - ${TODAY}"
 
           if [ -n "$ADDED" ]; then
@@ -145,19 +140,16 @@ jobs:
             NEW_ENTRY="${NEW_ENTRY}\n\n### Fixed\n${FIXED}"
           fi
 
-          # If no entries found, add a placeholder
           if [ -z "$ADDED" ] && [ -z "$CHANGED" ] && [ -z "$FIXED" ]; then
             NEW_ENTRY="${NEW_ENTRY}\n\n- See [release notes](https://github.com/sinzin91/search-sessions/releases/tag/v${NEXT_VERSION}) for details"
           fi
 
-          # Build version comparison link
           if [ -n "$LAST_TAG" ]; then
             LINK="[${NEXT_VERSION}]: https://github.com/sinzin91/search-sessions/compare/${LAST_TAG}...v${NEXT_VERSION}"
           else
             LINK="[${NEXT_VERSION}]: https://github.com/sinzin91/search-sessions/releases/tag/v${NEXT_VERSION}"
           fi
 
-          # Insert new entry before first existing "## [" entry
           FIRST_ENTRY_LINE=$(grep -n "^## \[" CHANGELOG.md | head -1 | cut -d: -f1 || echo "")
 
           if [ -n "$FIRST_ENTRY_LINE" ]; then
@@ -178,7 +170,6 @@ jobs:
 
           mv CHANGELOG.tmp CHANGELOG.md
 
-          # Idempotent link insertion: only add if not already present
           if ! grep -qF "[${NEXT_VERSION}]:" CHANGELOG.md; then
             echo "$LINK" >> CHANGELOG.md
           fi
@@ -186,31 +177,49 @@ jobs:
           echo "Updated CHANGELOG.md:"
           head -40 CHANGELOG.md
 
-      - name: Commit & tag
-        if: ${{ inputs.dry_run == false }}
+      - name: Commit changes
         run: |
           git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "release: v${{ steps.next.outputs.version }}"
-          git tag "v${{ steps.next.outputs.version }}"
-          git push origin ${{ github.ref_name }} --tags
 
       - name: Dry run summary
         if: ${{ inputs.dry_run == true }}
         run: |
           echo "🏜️ Dry run — would have:"
           echo "  - Bumped ${{ steps.current.outputs.version }} → ${{ steps.next.outputs.version }}"
-          echo "  - Tagged v${{ steps.next.outputs.version }}"
           echo "  - Updated CHANGELOG.md"
-          echo "  - Pushed to main"
+          echo "  - Created PR: release/v${{ steps.next.outputs.version }} → main"
           echo ""
           echo "Cargo.toml diff:"
-          git diff Cargo.toml
+          git diff HEAD~1 Cargo.toml
           echo ""
           echo "CHANGELOG.md diff:"
-          git diff CHANGELOG.md
+          git diff HEAD~1 CHANGELOG.md
+
+      - name: Push branch & create PR
+        if: ${{ inputs.dry_run == false }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          git push origin release/v${{ steps.next.outputs.version }}
+
+          gh pr create \
+            --base main \
+            --head release/v${{ steps.next.outputs.version }} \
+            --title "release: v${{ steps.next.outputs.version }}" \
+            --body "## Release v${{ steps.next.outputs.version }}
+
+          Automated release PR created by the cut-release workflow.
+
+          **Changes:**
+          - Bumped \`Cargo.toml\` from ${{ steps.current.outputs.version }} → ${{ steps.next.outputs.version }}
+          - Updated \`Cargo.lock\`
+          - Updated \`CHANGELOG.md\`
+
+          **After merging:** The release-on-merge workflow will automatically tag and create the GitHub Release with binaries."
 
       - name: Summary
         if: ${{ inputs.dry_run == false }}
         run: |
-          echo "🚀 Released v${{ steps.next.outputs.version }}"
-          echo "The release build workflow will now run automatically."
+          echo "📋 Created release PR for v${{ steps.next.outputs.version }}"
+          echo "Merge the PR to trigger tagging and release."
