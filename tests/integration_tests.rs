@@ -148,7 +148,7 @@ mod cli_integration {
             .expect("Failed to run binary");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Search Claude Code or OpenClaw session history"));
+        assert!(stdout.contains("Search Claude Code"));
         assert!(stdout.contains("--openclaw"));
         assert!(stdout.contains("--deep"));
         assert!(stdout.contains("--limit"));
@@ -308,5 +308,144 @@ mod query_matching {
         // OpenClaw session should have both "security" and "audit"
         assert!(openclaw_content.contains("security"));
         assert!(openclaw_content.contains("audit"));
+    }
+}
+
+mod obsidian_search {
+    use super::*;
+
+    fn obsidian_vault_dir() -> PathBuf {
+        fixtures_dir().join("obsidian-vault")
+    }
+
+    #[test]
+    fn test_obsidian_vault_fixture_exists() {
+        let vault = obsidian_vault_dir();
+        assert!(vault.exists(), "Obsidian vault fixture should exist");
+        assert!(vault.is_dir(), "Obsidian vault should be a directory");
+    }
+
+    #[test]
+    fn test_obsidian_vault_has_markdown_files() {
+        let vault = obsidian_vault_dir();
+        let daily = vault.join("Daily Notes.md");
+        let projects = vault.join("Projects.md");
+
+        assert!(daily.exists(), "Daily Notes.md should exist");
+        assert!(projects.exists(), "Projects.md should exist");
+    }
+
+    #[test]
+    fn test_obsidian_vault_content() {
+        let daily_content = fs::read_to_string(obsidian_vault_dir().join("Daily Notes.md"))
+            .expect("Failed to read");
+        let projects_content =
+            fs::read_to_string(obsidian_vault_dir().join("Projects.md")).expect("Failed to read");
+
+        // Verify searchable content
+        assert!(daily_content.contains("authentication"));
+        assert!(daily_content.contains("OAuth2"));
+        assert!(daily_content.contains("Kubernetes"));
+        assert!(daily_content.contains("Redis"));
+
+        assert!(projects_content.contains("Obsidian"));
+        assert!(projects_content.contains("RBAC"));
+    }
+
+    #[test]
+    fn test_help_shows_obsidian_flag() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .arg("--help")
+            .output()
+            .expect("Failed to run binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("--obsidian"),
+            "Help should mention --obsidian flag"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_search_finds_results() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .args([
+                "--obsidian",
+                obsidian_vault_dir().to_str().unwrap(),
+                "authentication",
+            ])
+            .output()
+            .expect("Failed to run binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("OBSIDIAN SEARCH"),
+            "Should show Obsidian search header, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("matches found"),
+            "Should find matches, got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_search_and_semantics() {
+        ensure_binary_built();
+
+        // Search for "Kubernetes RBAC" - both terms must match
+        let output = Command::new(binary_path())
+            .args([
+                "--obsidian",
+                obsidian_vault_dir().to_str().unwrap(),
+                "Kubernetes",
+                "RBAC",
+            ])
+            .output()
+            .expect("Failed to run binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Should find in Projects.md where both terms appear
+        assert!(
+            stdout.contains("matches found"),
+            "Should find AND matches, got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_missing_vault_error() {
+        ensure_binary_built();
+
+        let output = Command::new(binary_path())
+            .args(["--obsidian", "/nonexistent/vault", "test"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not found") || stderr.contains("ERROR"),
+            "Should show error for missing vault, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_file_instead_of_directory_error() {
+        ensure_binary_built();
+
+        // Pass a file instead of a directory
+        let file_path = obsidian_vault_dir().join("Daily Notes.md");
+        let output = Command::new(binary_path())
+            .args(["--obsidian", file_path.to_str().unwrap(), "test"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not a directory") || stderr.contains("ERROR"),
+            "Should show error for file instead of directory, got: {stderr}"
+        );
     }
 }
