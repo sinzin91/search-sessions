@@ -1672,6 +1672,13 @@ fn main() {
             );
             std::process::exit(1);
         }
+        if !vault_path.is_dir() {
+            eprintln!(
+                "ERROR: Obsidian vault path is not a directory: {}",
+                vault_path.display()
+            );
+            std::process::exit(1);
+        }
 
         let matches = search_obsidian(&query, cli.limit, vault_path);
         print_obsidian_results(&matches, &query, cli.limit, vault_path);

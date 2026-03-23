@@ -426,4 +426,22 @@ mod obsidian_search {
             "Should show error for missing vault, got: {stderr}"
         );
     }
+
+    #[test]
+    fn test_obsidian_file_instead_of_directory_error() {
+        ensure_binary_built();
+
+        // Pass a file instead of a directory
+        let file_path = obsidian_vault_dir().join("Daily Notes.md");
+        let output = Command::new(binary_path())
+            .args(["--obsidian", file_path.to_str().unwrap(), "test"])
+            .output()
+            .expect("Failed to run binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not a directory") || stderr.contains("ERROR"),
+            "Should show error for file instead of directory, got: {stderr}"
+        );
+    }
 }
