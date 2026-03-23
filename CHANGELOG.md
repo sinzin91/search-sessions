@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [0.3.0] - 2026-03-23
+
+### Added
+
+- add Obsidian vault search support (--obsidian flag) (#20)
+- add date range filtering support (--since, --until, --date) (#15)
+- auto-generate CHANGELOG.md during cut-release (#17)
+- automate cargo publish + homebrew tap update on release (#16)
+
+### Changed
+
+- bump version to 0.2.0 (#18)
+- add automated release cutting workflow (#13)
+- switch cut-release to PR-based flow (#19)
+- use RELEASE_TOKEN for cut-release workflow
+- simplify Quick Start with paste-able prompt (#12)
+
 ## [0.1.1] - 2026-02-11
 
 ### Added
@@ -40,3 +58,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [0.1.1]: https://github.com/sinzin91/search-sessions/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sinzin91/search-sessions/releases/tag/v0.1.0
+[0.3.0]: https://github.com/sinzin91/search-sessions/compare/v0.1.1...v0.3.0
