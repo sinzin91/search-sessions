@@ -1607,10 +1607,7 @@ fn print_obsidian_results(matches: &[ObsidianMatch], query: &str, limit: usize, 
     let displayed = &matches[..total.min(limit)];
 
     let sep = "=".repeat(60);
-    let vault_name = vault_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let vault_name = vault_path.file_name().unwrap_or_default().to_string_lossy();
     println!("\n{sep}");
     println!("  OBSIDIAN SEARCH ({}): \"{}\"", vault_name, query);
     if total > limit {

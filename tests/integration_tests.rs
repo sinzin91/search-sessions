@@ -337,8 +337,8 @@ mod obsidian_search {
 
     #[test]
     fn test_obsidian_vault_content() {
-        let daily_content =
-            fs::read_to_string(obsidian_vault_dir().join("Daily Notes.md")).expect("Failed to read");
+        let daily_content = fs::read_to_string(obsidian_vault_dir().join("Daily Notes.md"))
+            .expect("Failed to read");
         let projects_content =
             fs::read_to_string(obsidian_vault_dir().join("Projects.md")).expect("Failed to read");
 
@@ -373,7 +373,11 @@ mod obsidian_search {
         ensure_binary_built();
 
         let output = Command::new(binary_path())
-            .args(["--obsidian", obsidian_vault_dir().to_str().unwrap(), "authentication"])
+            .args([
+                "--obsidian",
+                obsidian_vault_dir().to_str().unwrap(),
+                "authentication",
+            ])
             .output()
             .expect("Failed to run binary");
 
