@@ -20,7 +20,7 @@ const MAX_MATCHES_PER_SESSION: usize = 2;
 #[derive(Parser)]
 #[command(
     name = "search-sessions",
-    about = "Search Claude Code or OpenClaw session history"
+    about = "Search Claude Code, OpenClaw session history, or Obsidian vaults"
 )]
 struct Cli {
     /// Search query (words are ANDed together)
@@ -33,6 +33,10 @@ struct Cli {
     /// Search OpenClaw sessions instead of Claude Code
     #[arg(long)]
     openclaw: bool,
+
+    /// Search an Obsidian vault directory
+    #[arg(long)]
+    obsidian: Option<PathBuf>,
 
     /// Maximum results to show
     #[arg(long, default_value_t = DEFAULT_LIMIT)]
@@ -118,6 +122,14 @@ struct SessionIndexEntry {
 struct OpenClawSessionMeta {
     cwd: String,
     timestamp: String,
+}
+
+/// Obsidian search result
+struct ObsidianMatch {
+    file_path: PathBuf,
+    file_name: String,
+    snippet: String,
+    line_number: usize,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -1270,6 +1282,205 @@ fn search_deep_openclaw(
     matches
 }
 
+// ─── Obsidian Search ────────────────────────────────────────────────
+
+/// Find all markdown files in an Obsidian vault
+fn find_markdown_files(base: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            // Skip symlinks
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                // Skip hidden directories (like .obsidian, .git, .trash)
+                if path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                {
+                    continue;
+                }
+                walk_dir(&path, files);
+            } else if file_type.is_file() && path.extension().is_some_and(|e| e == "md") {
+                files.push(path);
+            }
+        }
+    }
+
+    walk_dir(base, &mut files);
+    files
+}
+
+/// Search Obsidian vault using ripgrep
+fn search_obsidian(query: &str, limit: usize, base: &Path) -> Vec<ObsidianMatch> {
+    if !is_ripgrep_available() {
+        return search_obsidian_rust(query, limit, base);
+    }
+
+    let query_terms_lower: Vec<String> =
+        query.split_whitespace().map(|s| s.to_lowercase()).collect();
+
+    let output = Command::new("rg")
+        .args([
+            "--no-heading",
+            "--line-number",
+            "--ignore-case",
+            "--glob",
+            "*.md",
+            "--glob",
+            "!.obsidian/**",
+            "--glob",
+            "!.git/**",
+            "--glob",
+            "!.trash/**",
+            query,
+        ])
+        .arg(base)
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
+            return search_obsidian_rust(query, limit, base);
+        }
+    };
+
+    if !output.status.success() && output.status.code() != Some(1) {
+        eprintln!(
+            "WARNING: ripgrep returned unexpected exit code: {:?}",
+            output.status.code()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut matches = Vec::new();
+    let mut seen_files: HashMap<PathBuf, usize> = HashMap::new();
+
+    for line in stdout.lines() {
+        if matches.len() >= limit {
+            break;
+        }
+
+        // Parse rg output: /path/to/file.md:LINE_NUM:content
+        let Some(first_colon) = line.find(':') else {
+            continue;
+        };
+        let path = PathBuf::from(&line[..first_colon]);
+        let rest = &line[first_colon + 1..];
+
+        let Some(second_colon) = rest.find(':') else {
+            continue;
+        };
+        let line_num: usize = rest[..second_colon].parse().unwrap_or(0);
+        let content = &rest[second_colon + 1..];
+
+        // Limit matches per file
+        let count = seen_files.entry(path.clone()).or_insert(0);
+        if *count >= MAX_MATCHES_PER_SESSION {
+            continue;
+        }
+
+        // Verify all terms match (rg matches any)
+        let content_lower = content.to_lowercase();
+        if !matches_all_terms(&content_lower, &query_terms_lower) {
+            continue;
+        }
+
+        let file_name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let snippet = get_snippet(content, query, 80);
+
+        matches.push(ObsidianMatch {
+            file_path: path,
+            file_name,
+            snippet,
+            line_number: line_num,
+        });
+
+        *count += 1;
+    }
+
+    matches
+}
+
+/// Pure Rust fallback for Obsidian search
+fn search_obsidian_rust(query: &str, limit: usize, base: &Path) -> Vec<ObsidianMatch> {
+    warn_ripgrep_not_available();
+
+    let query_terms_lower: Vec<String> =
+        query.split_whitespace().map(|s| s.to_lowercase()).collect();
+
+    let md_files = find_markdown_files(base);
+
+    let mut matches = Vec::new();
+    let mut seen_files: HashMap<PathBuf, usize> = HashMap::new();
+
+    'outer: for file_path in md_files {
+        let Ok(file) = File::open(&file_path) else {
+            continue;
+        };
+        let reader = BufReader::new(file);
+
+        for (line_idx, line_result) in reader.lines().enumerate() {
+            if matches.len() >= limit {
+                break 'outer;
+            }
+
+            let Ok(line) = line_result else {
+                continue;
+            };
+
+            let count = seen_files.entry(file_path.clone()).or_insert(0);
+            if *count >= MAX_MATCHES_PER_SESSION {
+                break; // Move to next file
+            }
+
+            let line_lower = line.to_lowercase();
+            if !matches_all_terms(&line_lower, &query_terms_lower) {
+                continue;
+            }
+
+            let file_name = file_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            let snippet = get_snippet(&line, query, 80);
+
+            matches.push(ObsidianMatch {
+                file_path: file_path.clone(),
+                file_name,
+                snippet,
+                line_number: line_idx + 1,
+            });
+
+            *count += 1;
+        }
+    }
+
+    matches
+}
+
 // ─── Output Formatting ─────────────────────────────────────────────
 
 fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
@@ -1391,6 +1602,43 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
     println!("{sep}\n");
 }
 
+fn print_obsidian_results(matches: &[ObsidianMatch], query: &str, limit: usize, vault_path: &Path) {
+    let total = matches.len();
+    let displayed = &matches[..total.min(limit)];
+
+    let sep = "=".repeat(60);
+    let vault_name = vault_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    println!("\n{sep}");
+    println!("  OBSIDIAN SEARCH ({}): \"{}\"", vault_name, query);
+    if total > limit {
+        println!("  {total} matches found (showing top {limit})");
+    } else {
+        println!("  {total} matches found");
+    }
+    println!("{sep}\n");
+
+    if displayed.is_empty() {
+        println!("  No matches found in vault.\n");
+        return;
+    }
+
+    for (i, m) in displayed.iter().enumerate() {
+        let path_short = format_project_path(&m.file_path.to_string_lossy());
+        let clean_snippet: String = m.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        println!("  [{}] {}", i + 1, m.file_name);
+        println!("      File:     {path_short}");
+        println!("      Line:     {}", m.line_number);
+        println!("      Snippet:  {clean_snippet}");
+        println!();
+    }
+
+    println!("{sep}\n");
+}
+
 // ─── Main ───────────────────────────────────────────────────────────
 
 fn main() {
@@ -1415,7 +1663,19 @@ fn main() {
         }
     };
 
-    if cli.openclaw {
+    if let Some(ref vault_path) = cli.obsidian {
+        // Obsidian mode
+        if !vault_path.exists() {
+            eprintln!(
+                "ERROR: Obsidian vault directory not found: {}",
+                vault_path.display()
+            );
+            std::process::exit(1);
+        }
+
+        let matches = search_obsidian(&query, cli.limit, vault_path);
+        print_obsidian_results(&matches, &query, cli.limit, vault_path);
+    } else if cli.openclaw {
         // OpenClaw mode
         let base = openclaw_sessions_dir(&cli.agent);
         if !base.exists() {
