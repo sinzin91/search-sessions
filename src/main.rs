@@ -76,6 +76,7 @@ struct IndexMatch {
     message_count: u64,
     matched_field: String,
     score: f64,
+    custom_title: Option<String>,
 }
 
 struct DeepMatch {
@@ -86,6 +87,7 @@ struct DeepMatch {
     timestamp: String,
     summary: Option<String>,
     first_prompt: Option<String>,
+    custom_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -454,6 +456,7 @@ fn search_index(
     project_filter: Option<&str>,
     base: &Path,
     date_range: &DateRange,
+    custom_titles: &HashMap<String, String>,
 ) -> Vec<IndexMatch> {
     let query_terms: Vec<&str> = query.split_whitespace().collect();
     let mut matches = Vec::new();
@@ -495,6 +498,7 @@ fn search_index(
                     message_count: entry.message_count,
                     matched_field,
                     score,
+                    custom_title: custom_titles.get(&entry.session_id).cloned(),
                 });
             }
         }
@@ -667,6 +671,40 @@ fn build_index_lookup(base: &Path) -> HashMap<String, SessionIndexEntry> {
     lookup
 }
 
+fn build_custom_title_lookup(base: &Path) -> HashMap<String, String> {
+    let mut lookup = HashMap::new();
+    let jsonl_files = find_jsonl_files(base, true, false);
+    for file_path in jsonl_files {
+        let session_id = session_id_from_path(&file_path);
+        if session_id.is_empty() {
+            continue;
+        }
+        let Ok(file) = File::open(&file_path) else {
+            continue;
+        };
+        let reader = BufReader::new(file);
+        let mut last_title: Option<String> = None;
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            if !line.contains("\"custom-title\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(title) = v.get("customTitle").and_then(|t| t.as_str()) {
+                if !title.is_empty() {
+                    last_title = Some(title.to_string());
+                }
+            }
+        }
+        if let Some(title) = last_title {
+            lookup.insert(session_id, title);
+        }
+    }
+    lookup
+}
+
 /// Parse a single ripgrep output line: /path/to/file.jsonl:LINE_NUM:json_content
 fn parse_rg_line(line: &str) -> Option<(PathBuf, serde_json::Value)> {
     // Split on first two colons
@@ -825,6 +863,7 @@ fn search_deep_claude_rust(
     project_filter: Option<&str>,
     base: &Path,
     date_range: &DateRange,
+    custom_titles: &HashMap<String, String>,
 ) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
@@ -912,6 +951,7 @@ fn search_deep_claude_rust(
                 timestamp,
                 summary: index_entry.map(|e| e.summary.clone()),
                 first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+                custom_title: custom_titles.get(&session_id).cloned(),
             });
 
             *count += 1;
@@ -1011,6 +1051,7 @@ fn search_deep_openclaw_rust(
                 timestamp,
                 summary: None,
                 first_prompt: None,
+                custom_title: None,
             });
 
             *count += 1;
@@ -1026,10 +1067,11 @@ fn search_deep_claude(
     project_filter: Option<&str>,
     base: &Path,
     date_range: &DateRange,
+    custom_titles: &HashMap<String, String>,
 ) -> Vec<DeepMatch> {
     // Check if ripgrep is available, fall back to pure Rust if not
     if !is_ripgrep_available() {
-        return search_deep_claude_rust(query, limit, project_filter, base, date_range);
+        return search_deep_claude_rust(query, limit, project_filter, base, date_range, custom_titles);
     }
 
     let search_path = resolve_search_path(base, project_filter);
@@ -1059,7 +1101,7 @@ fn search_deep_claude(
         Err(e) => {
             // Fallback to Rust if ripgrep fails unexpectedly
             eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
-            return search_deep_claude_rust(query, limit, project_filter, base, date_range);
+            return search_deep_claude_rust(query, limit, project_filter, base, date_range, custom_titles);
         }
     };
 
@@ -1143,6 +1185,7 @@ fn search_deep_claude(
             timestamp,
             summary: index_entry.map(|e| e.summary.clone()),
             first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+            custom_title: custom_titles.get(&session_id).cloned(),
         });
 
         *count += 1;
@@ -1274,6 +1317,7 @@ fn search_deep_openclaw(
             timestamp,
             summary: None,
             first_prompt: None,
+            custom_title: None,
         });
 
         *count += 1;
@@ -1513,6 +1557,9 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
             &m.summary
         };
         println!("  [{}] {}", i + 1, label);
+        if let Some(ref title) = m.custom_title {
+            println!("      Label:    {title}");
+        }
         println!("      Project:  {project_short}");
         if !m.git_branch.is_empty() {
             println!("      Branch:   {}", m.git_branch);
@@ -1584,6 +1631,9 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
             .unwrap_or("(no summary)");
 
         println!("  [{}] [{}] {}", i + 1, role, label);
+        if let Some(ref title) = m.custom_title {
+            println!("      Label:    {title}");
+        }
         println!("      Project:  {project_short}");
         println!("      Date:     {ts}");
         let clean_snippet: String = m.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1710,12 +1760,13 @@ fn main() {
         }
 
         let project_filter = cli.project.as_deref();
+        let custom_titles = build_custom_title_lookup(&base);
 
         if cli.deep {
-            let matches = search_deep_claude(&query, cli.limit, project_filter, &base, &date_range);
+            let matches = search_deep_claude(&query, cli.limit, project_filter, &base, &date_range, &custom_titles);
             print_deep_results(&matches, &query, cli.limit, false);
         } else {
-            let matches = search_index(&query, project_filter, &base, &date_range);
+            let matches = search_index(&query, project_filter, &base, &date_range, &custom_titles);
             print_index_results(&matches, &query, cli.limit);
         }
     }
