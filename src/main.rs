@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeDelta, Utc};
 use clap::Parser;
@@ -818,6 +818,75 @@ fn find_jsonl_files(base: &Path, exclude_subagents: bool, exclude_deleted: bool)
     files
 }
 
+/// Mirror Claude Code's project-folder encoding: every non-alphanumeric char → '-'.
+/// e.g. `/Users/arjun/Documents/sandbox/hypeo` → `-Users-arjun-Documents-sandbox-hypeo`.
+fn encode_project_folder(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Resolve a session's *canonical* project directory — the cwd Claude Code was launched
+/// in, which the session file is filed under — rather than a transient cwd recorded after
+/// the shell `cd`'d into a subdirectory. The resume command must `cd` into this directory
+/// for the session to belong to the right project (Claude Code's interactive picker is
+/// scoped per project folder).
+///
+/// The folder name under `~/.claude/projects/` is the launch cwd with every non-alphanumeric
+/// char replaced by '-', which is lossy (both '/' and '-' map to '-'), so it can't be reversed
+/// directly. Instead we find the recorded `cwd` whose encoding equals the folder name. The
+/// matched record's own cwd is checked first (no I/O); otherwise we scan the session file.
+/// Successful resolutions are memoized per project folder. Falls back to `fallback_cwd` when
+/// nothing matches (e.g. remote `ssh-<uuid>` folders, or a project that was moved on disk).
+fn resolve_project_dir(jsonl_path: &Path, fallback_cwd: &str) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+    let Some(folder_dir) = jsonl_path.parent() else {
+        return fallback_cwd.to_string();
+    };
+    let Some(folder_name) = folder_dir.file_name().and_then(|n| n.to_str()) else {
+        return fallback_cwd.to_string();
+    };
+
+    // Fast path: the matched record's own cwd is already the project root.
+    if encode_project_folder(fallback_cwd) == folder_name {
+        return fallback_cwd.to_string();
+    }
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(folder_dir).cloned() {
+        return hit;
+    }
+
+    // Scan the session file for the cwd whose encoding matches the folder name.
+    let mut resolved: Option<String> = None;
+    if let Ok(file) = File::open(jsonl_path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(cwd) = record.get("cwd").and_then(|c| c.as_str())
+                && !cwd.is_empty()
+                && encode_project_folder(cwd) == folder_name
+            {
+                resolved = Some(cwd.to_string());
+                break;
+            }
+        }
+    }
+
+    match resolved {
+        Some(dir) => {
+            cache
+                .lock()
+                .unwrap()
+                .insert(folder_dir.to_path_buf(), dir.clone());
+            dir
+        }
+        None => fallback_cwd.to_string(),
+    }
+}
+
 /// Pure Rust deep search for Claude Code sessions (fallback when ripgrep unavailable)
 fn search_deep_claude_rust(
     query: &str,
@@ -890,7 +959,7 @@ fn search_deep_claude_rust(
                 .get("cwd")
                 .and_then(|c| c.as_str())
                 .filter(|s| !s.is_empty())
-                .map(String::from)
+                .map(|cwd| resolve_project_dir(&file_path, cwd))
                 .or_else(|| index_entry.map(|e| e.project_path.clone()))
                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -1081,7 +1150,7 @@ fn search_deep_claude(
             break;
         }
 
-        let (_path, record) = match parse_rg_line(line) {
+        let (path, record) = match parse_rg_line(line) {
             Some(r) => r,
             None => continue,
         };
@@ -1121,7 +1190,7 @@ fn search_deep_claude(
             .get("cwd")
             .and_then(|c| c.as_str())
             .filter(|s| !s.is_empty())
-            .map(String::from)
+            .map(|cwd| resolve_project_dir(&path, cwd))
             .or_else(|| index_entry.map(|e| e.project_path.clone()))
             .unwrap_or_else(|| "unknown".to_string());
 
