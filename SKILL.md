@@ -1,11 +1,11 @@
 ---
 name: search-sessions
-description: "Search across Claude Code, OpenClaw, and Obsidian session history. Use when you need to find past conversations, query sessions by date range, filter by project, search Obsidian vaults, or resume previous sessions by UUID."
+description: "Search across Claude Code and OpenClaw session history, plus Obsidian vaults. Use when you need to find past conversations, query sessions by date range, filter by project, search Obsidian notes, or resume previous sessions by UUID."
 ---
 
 # search-sessions
 
-Fast CLI to search across all Claude Code, OpenClaw, and Obsidian session history. Find past decisions, code snippets, and resume any previous session.
+Fast CLI to search across all Claude Code and OpenClaw session history, plus Obsidian vaults. Find past decisions, code snippets, and resume any previous session.
 
 **Announce at start:** "I'm using search-sessions to find that in your session history."
 
