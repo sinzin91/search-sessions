@@ -20,7 +20,7 @@ const MAX_MATCHES_PER_SESSION: usize = 2;
 #[derive(Parser)]
 #[command(
     name = "search-sessions",
-    about = "Search Claude Code, OpenClaw session history, or Obsidian vaults"
+    about = "Search Claude Code, Codex, OpenClaw session history, or Obsidian vaults"
 )]
 struct Cli {
     /// Search query (words are ANDed together)
@@ -33,6 +33,10 @@ struct Cli {
     /// Search OpenClaw sessions instead of Claude Code
     #[arg(long)]
     openclaw: bool,
+
+    /// Search Codex sessions (every ~/.codex*/sessions and $CODEX_HOME) instead of Claude Code
+    #[arg(long, conflicts_with = "openclaw")]
+    codex: bool,
 
     /// Search an Obsidian vault directory
     #[arg(long)]
@@ -140,6 +144,21 @@ struct OpenClawSessionMeta {
     timestamp: String,
 }
 
+/// Codex thread metadata from the session_meta record that opens each rollout
+struct CodexSessionMeta {
+    id: String,
+    cwd: String,
+    is_subagent: bool,
+}
+
+/// Which harness a deep search read, for the header and the resume command
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    ClaudeCode,
+    Codex,
+    OpenClaw,
+}
+
 /// Obsidian search result
 #[derive(Serialize)]
 struct ObsidianMatch {
@@ -164,6 +183,19 @@ struct ObsidianMatch {
 /// a code change. CLAUDE_CONFIG_DIR is honoured explicitly in case it points
 /// outside the home directory.
 fn claude_projects_dirs() -> Vec<PathBuf> {
+    config_roots(".claude", "CLAUDE_CONFIG_DIR", "projects")
+}
+
+/// Every Codex config root that holds a sessions/ tree: ~/.codex, ~/.codex-work
+/// and any other ~/.codex* overlay, plus $CODEX_HOME. Same account split, and
+/// the same silent "no matches" when only one root is read, as Claude.
+fn codex_sessions_dirs() -> Vec<PathBuf> {
+    config_roots(".codex", "CODEX_HOME", "sessions")
+}
+
+/// `<env_var>/<subdir>`, `~/<prefix>/<subdir>`, then every sibling
+/// `~/<prefix>*/<subdir>` that is a directory, deduplicated, siblings sorted.
+fn config_roots(prefix: &str, env_var: &str, subdir: &str) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut push = |dir: PathBuf| {
         if dir.is_dir() && !roots.contains(&dir) {
@@ -171,14 +203,14 @@ fn claude_projects_dirs() -> Vec<PathBuf> {
         }
     };
 
-    if let Ok(configured) = std::env::var("CLAUDE_CONFIG_DIR")
+    if let Ok(configured) = std::env::var(env_var)
         && !configured.is_empty()
     {
-        push(PathBuf::from(configured).join("projects"));
+        push(PathBuf::from(configured).join(subdir));
     }
 
     if let Some(home) = dirs::home_dir() {
-        push(home.join(".claude").join("projects"));
+        push(home.join(prefix).join(subdir));
 
         if let Ok(entries) = fs::read_dir(&home) {
             let mut siblings: Vec<PathBuf> = entries
@@ -187,9 +219,9 @@ fn claude_projects_dirs() -> Vec<PathBuf> {
                 .filter(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(".claude"))
+                        .is_some_and(|name| name.starts_with(prefix))
                 })
-                .map(|path| path.join("projects"))
+                .map(|path| path.join(subdir))
                 .filter(|path| path.is_dir())
                 .collect();
             // read_dir order is filesystem-dependent; sort so results are
@@ -1469,6 +1501,284 @@ fn search_deep_openclaw(
     matches
 }
 
+// ─── Codex Search ───────────────────────────────────────────────────
+
+/// Text of a Codex conversation turn, or None for any other record.
+///
+/// Turns are `response_item` records whose payload is a user or assistant
+/// `message`. Developer messages and the harness text Codex injects as user
+/// items (AGENTS.md instructions, `<environment_context>`, `<skill>` bodies)
+/// are dropped, so a hit is something a person typed
+/// or the model answered. The `event_msg` copy of each prompt is ignored so a
+/// prompt is not counted twice.
+fn extract_text_codex(record: &serde_json::Value) -> Option<(String, String)> {
+    if record.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
+        return None;
+    }
+    let role = payload.get("role").and_then(|r| r.as_str())?;
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let text = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(|t| t.as_str()),
+                Some("input_text" | "output_text")
+            )
+        })
+        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+        .filter(|text| {
+            role != "user" || !(text.starts_with('<') || text.starts_with("# AGENTS.md"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    Some((role.to_string(), text))
+}
+
+/// Read the session_meta record on the first line of a rollout.
+fn load_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    let mut first_line = String::new();
+    BufReader::new(File::open(path).ok()?)
+        .read_line(&mut first_line)
+        .ok()?;
+    let record: serde_json::Value = serde_json::from_str(&first_line).ok()?;
+    if record.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    let field = |name: &str| {
+        payload
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(CodexSessionMeta {
+        id: field("id"),
+        cwd: field("cwd"),
+        is_subagent: field("thread_source") == "subagent",
+    })
+}
+
+/// Thread names from `<codex home>/session_index.jsonl`. A rename appends a
+/// new line for the same id, so the last line wins.
+fn load_codex_thread_names(codex_home: &Path) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Ok(file) = File::open(codex_home.join("session_index.jsonl")) else {
+        return names;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let (Some(id), Some(name)) = (
+            entry.get("id").and_then(|v| v.as_str()),
+            entry.get("thread_name").and_then(|v| v.as_str()),
+        ) {
+            names.insert(id.to_string(), name.to_string());
+        }
+    }
+    names
+}
+
+/// Codex session id when session_meta is unreadable: the UUID that ends
+/// `rollout-<timestamp>-<uuid>.jsonl`.
+fn codex_id_from_path(path: &Path) -> String {
+    let stem = session_id_from_path(path);
+    let start = stem.len().saturating_sub(36);
+    stem.get(start..).unwrap_or(&stem).to_string()
+}
+
+/// Turns ripgrep or fallback hits from one Codex root into DeepMatches.
+struct CodexScan<'a> {
+    query: &'a str,
+    terms: Vec<String>,
+    project_filter: Option<String>,
+    date_range: &'a DateRange,
+    codex_home: PathBuf,
+    thread_names: HashMap<String, String>,
+    metas: HashMap<PathBuf, Option<CodexSessionMeta>>,
+    per_session: HashMap<String, usize>,
+}
+
+impl<'a> CodexScan<'a> {
+    fn new(
+        query: &'a str,
+        project_filter: Option<&str>,
+        sessions_dir: &Path,
+        date_range: &'a DateRange,
+    ) -> Self {
+        let codex_home = sessions_dir.parent().unwrap_or(sessions_dir).to_path_buf();
+        Self {
+            query,
+            terms: query.split_whitespace().map(|s| s.to_lowercase()).collect(),
+            project_filter: project_filter.map(str::to_lowercase),
+            date_range,
+            thread_names: load_codex_thread_names(&codex_home),
+            codex_home,
+            metas: HashMap::new(),
+            per_session: HashMap::new(),
+        }
+    }
+
+    fn consider(
+        &mut self,
+        path: &Path,
+        record_line: usize,
+        record: &serde_json::Value,
+    ) -> Option<DeepMatch> {
+        let (role, text) = extract_text_codex(record)?;
+        if !matches_all_terms(&text.to_lowercase(), &self.terms) {
+            return None;
+        }
+        let timestamp = record
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !self.date_range.contains(&timestamp) {
+            return None;
+        }
+
+        let meta = self
+            .metas
+            .entry(path.to_path_buf())
+            .or_insert_with(|| load_codex_session_meta(path));
+        // Subagent threads are the model talking to itself; Claude mode skips
+        // its subagents/ transcripts for the same reason.
+        if meta.as_ref().is_some_and(|m| m.is_subagent) {
+            return None;
+        }
+        let cwd = meta.as_ref().map(|m| m.cwd.clone()).unwrap_or_default();
+        if let Some(filter) = &self.project_filter
+            && !cwd.to_lowercase().contains(filter)
+        {
+            return None;
+        }
+        let session_id = meta
+            .as_ref()
+            .map(|m| m.id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| codex_id_from_path(path));
+
+        let count = self.per_session.entry(session_id.clone()).or_insert(0);
+        if *count >= MAX_MATCHES_PER_SESSION {
+            return None;
+        }
+        *count += 1;
+
+        Some(DeepMatch {
+            summary: self.thread_names.get(&session_id).cloned(),
+            session_id,
+            project_path: if cwd.is_empty() {
+                "unknown".to_string()
+            } else {
+                cwd
+            },
+            message_type: role,
+            snippet: get_snippet(&text, self.query, 80),
+            timestamp,
+            first_prompt: None,
+            transcript_path: path.to_string_lossy().into_owned(),
+            config_root: self.codex_home.to_string_lossy().into_owned(),
+            record_line,
+            record_uuid: String::new(),
+        })
+    }
+}
+
+/// Deep search one Codex sessions/ root, newest rollout first.
+///
+/// Rollouts live at YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl, so reverse
+/// path order is reverse chronological and `limit` keeps the newest hits.
+fn search_deep_codex(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+    sessions_dir: &Path,
+    date_range: &DateRange,
+) -> Vec<DeepMatch> {
+    let mut scan = CodexScan::new(query, project_filter, sessions_dir, date_range);
+    let mut matches = Vec::new();
+
+    let rg_output = if is_ripgrep_available() {
+        // --no-ignore: ~/.codex is commonly a git repo whose .gitignore is `*`
+        // (config versioned, transcripts not), and ripgrep would honour it
+        // and skip every rollout.
+        Command::new("rg")
+            .args([
+                "--no-heading",
+                "--line-number",
+                "--ignore-case",
+                "--no-ignore",
+                "--sortr=path",
+                "--glob",
+                "*.jsonl",
+                query,
+            ])
+            .arg(sessions_dir)
+            .output()
+            .map_err(|e| eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback."))
+            .ok()
+    } else {
+        warn_ripgrep_not_available();
+        None
+    };
+
+    if let Some(output) = rg_output {
+        if !output.status.success() && output.status.code() != Some(1) {
+            eprintln!(
+                "WARNING: ripgrep returned unexpected exit code: {:?}",
+                output.status.code()
+            );
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if matches.len() >= limit {
+                break;
+            }
+            if let Some((path, record_line, record)) = parse_rg_line(line)
+                && let Some(hit) = scan.consider(&path, record_line, &record)
+            {
+                matches.push(hit);
+            }
+        }
+        return matches;
+    }
+
+    let mut files = find_jsonl_files(sessions_dir, false, false);
+    files.sort_by(|a, b| b.cmp(a));
+    'outer: for path in files {
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        for (line_index, line) in BufReader::new(file).lines().enumerate() {
+            if matches.len() >= limit {
+                break 'outer;
+            }
+            let Ok(line) = line else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(hit) = scan.consider(&path, line_index + 1, &record) {
+                matches.push(hit);
+            }
+        }
+    }
+    matches
+}
+
 // ─── Obsidian Search ────────────────────────────────────────────────
 
 /// Find all markdown files in an Obsidian vault
@@ -1742,18 +2052,47 @@ fn print_jsonl<T: Serialize>(matches: &[T], limit: usize) {
     }
 }
 
-fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openclaw: bool) {
+/// Copy-pasteable resume command for a hit, or None when it cannot be resumed.
+/// A Codex hit outside the default Codex home names its CODEX_HOME, since
+/// `codex resume` looks the id up in one home only.
+fn resume_command(m: &DeepMatch, source: Source) -> Option<String> {
+    if m.project_path == "unknown" {
+        return None;
+    }
+    let project = format_project_path(&m.project_path);
+    match source {
+        Source::ClaudeCode => Some(format!("cd {project} && claude -r {}", m.session_id)),
+        Source::Codex => {
+            let default_home = std::env::var_os("CODEX_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
+            let env = if default_home.as_deref() == Some(Path::new(&m.config_root)) {
+                String::new()
+            } else {
+                format!("CODEX_HOME={} ", format_project_path(&m.config_root))
+            };
+            Some(format!(
+                "cd {project} && {env}codex resume {}",
+                m.session_id
+            ))
+        }
+        Source::OpenClaw => None,
+    }
+}
+
+fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, source: Source) {
     let total = matches.len();
     let displayed = &matches[..total.min(limit)];
 
     let sep = "=".repeat(60);
-    let source = if is_openclaw {
-        "OPENCLAW"
-    } else {
-        "CLAUDE CODE"
+    let source_name = match source {
+        Source::ClaudeCode => "CLAUDE CODE",
+        Source::Codex => "CODEX",
+        Source::OpenClaw => "OPENCLAW",
     };
     println!("\n{sep}");
-    println!("  DEEP SEARCH ({source}): \"{query}\"");
+    println!("  DEEP SEARCH ({source_name}): \"{query}\"");
     if total > limit {
         println!("  {total} matches found (showing top {limit})");
     } else {
@@ -1788,12 +2127,8 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
         let clean_snippet: String = m.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
         println!("      Snippet:  {clean_snippet}");
         println!("      Session:  {}", m.session_id);
-        // Print copy-pasteable resume command (Claude Code only, not OpenClaw)
-        if !is_openclaw && m.project_path != "unknown" {
-            println!(
-                "      Resume:   cd {} && claude -r {}",
-                project_short, m.session_id
-            );
+        if let Some(resume) = resume_command(m, source) {
+            println!("      Resume:   {resume}");
         }
         println!();
     }
@@ -1903,7 +2238,34 @@ fn main() {
         if matches!(cli.format, OutputFormat::Jsonl) {
             print_jsonl(&matches, cli.limit);
         } else {
-            print_deep_results(&matches, &query, cli.limit, true);
+            print_deep_results(&matches, &query, cli.limit, Source::OpenClaw);
+        }
+    } else if cli.codex {
+        // Codex mode. Deep search only: Codex keeps no searchable index.
+        let roots = codex_sessions_dirs();
+        if roots.is_empty() {
+            eprintln!(
+                "ERROR: no Codex sessions directory found under {} or $CODEX_HOME",
+                dirs::home_dir().unwrap_or_default().display()
+            );
+            std::process::exit(1);
+        }
+
+        let project_filter = cli.project.as_deref();
+        let mut matches: Vec<DeepMatch> = roots
+            .iter()
+            .flat_map(|root| {
+                search_deep_codex(&query, cli.limit, project_filter, root, &date_range)
+            })
+            .collect();
+        // Each root returned its newest hits. Unlike Claude deep hits, these
+        // carry a comparable key, so rank the merge by recency rather than
+        // round-robin: the newest hits win whichever account holds them.
+        matches.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        if matches!(cli.format, OutputFormat::Jsonl) {
+            print_jsonl(&matches, cli.limit);
+        } else {
+            print_deep_results(&matches, &query, cli.limit, Source::Codex);
         }
     } else {
         // Claude Code mode. Transcripts are split across config roots
@@ -1949,7 +2311,7 @@ fn main() {
             if matches!(cli.format, OutputFormat::Jsonl) {
                 print_jsonl(&matches, cli.limit);
             } else {
-                print_deep_results(&matches, &query, cli.limit, false);
+                print_deep_results(&matches, &query, cli.limit, Source::ClaudeCode);
             }
         } else {
             let mut matches = Vec::new();

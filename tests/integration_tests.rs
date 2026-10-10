@@ -140,6 +140,266 @@ mod multi_config_root {
     }
 }
 
+/// Codex keeps one rollout file per thread under <CODEX_HOME>/sessions/YYYY/MM/DD,
+/// split across accounts the same way Claude is (~/.codex, ~/.codex-work).
+mod codex_sessions {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    const PERSONAL: &str = "01a126af-0000-7000-8000-000000000001";
+    const WORK: &str = "01a126af-0000-7000-8000-000000000002";
+    const OLDER: &str = "01a126af-0000-7000-8000-000000000003";
+    const SUBAGENT: &str = "01a126af-0000-7000-8000-000000000004";
+
+    fn message(ts: &str, role: &str, kind: &str, texts: &[&str]) -> serde_json::Value {
+        let content: Vec<_> = texts
+            .iter()
+            .map(|text| json!({"type": kind, "text": text}))
+            .collect();
+        json!({"timestamp": ts, "type": "response_item",
+               "payload": {"type": "message", "role": role, "content": content}})
+    }
+
+    /// Writes one rollout the way codex-tui 0.16x does: session_meta first, then
+    /// harness-injected user items, the typed prompt, the reply, and the
+    /// event_msg copy of the prompt that every turn also records.
+    fn write_rollout(
+        codex_home: &Path,
+        day: &str,
+        id: &str,
+        cwd: &Path,
+        thread_source: &str,
+        prompt: &str,
+    ) {
+        let dir = codex_home.join("sessions/2026/10").join(day);
+        fs::create_dir_all(&dir).expect("create sessions dir");
+        let ts = format!("2026-10-{day}T10:00:00.000Z");
+        let records = [
+            json!({"timestamp": ts, "type": "session_meta",
+                   "payload": {"id": id, "timestamp": ts, "cwd": cwd,
+                               "thread_source": thread_source,
+                               "base_instructions": {"text": "zebrafish quokka"}}}),
+            message(&ts, "developer", "input_text", &["quokka developer text"]),
+            message(
+                &ts,
+                "user",
+                "input_text",
+                &[
+                    "# AGENTS.md instructions\n<INSTRUCTIONS>quokka</INSTRUCTIONS>",
+                    "<environment_context>quokka</environment_context>",
+                ],
+            ),
+            message(&ts, "user", "input_text", &[prompt]),
+            message(&ts, "assistant", "output_text", &["ok"]),
+            json!({"timestamp": ts, "type": "event_msg",
+                   "payload": {"type": "user_message", "message": prompt}}),
+        ];
+        let body: String = records.iter().map(|r| format!("{r}\n")).collect();
+        let name = format!("rollout-2026-10-{day}T10-00-00-{id}.jsonl");
+        fs::write(dir.join(name), body).expect("write rollout");
+    }
+
+    /// Personal root is a git repo ignoring everything, as ~/.codex is on a
+    /// machine that versions its Codex config: ripgrep honours that .gitignore
+    /// and skips every rollout unless told not to.
+    fn fake_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("tempdir");
+        let personal = home.path().join(".codex");
+        let work = home.path().join(".codex-work");
+        fs::create_dir_all(personal.join(".git")).expect("fake git dir");
+        fs::write(personal.join(".gitignore"), "*\n").expect("gitignore");
+        let zoo = home.path().join("dev/zoo");
+        let platform = home.path().join("work/billing-api");
+
+        write_rollout(
+            &personal,
+            "10",
+            PERSONAL,
+            &zoo,
+            "user",
+            "zebrafish migration personal",
+        );
+        write_rollout(
+            &personal,
+            "08",
+            OLDER,
+            &zoo,
+            "user",
+            "zebrafish migration older",
+        );
+        write_rollout(
+            &personal,
+            "10",
+            SUBAGENT,
+            &zoo,
+            "subagent",
+            "zebrafish subagent",
+        );
+        write_rollout(
+            &work,
+            "09",
+            WORK,
+            &platform,
+            "user",
+            "zebrafish migration work",
+        );
+        fs::write(
+            personal.join("session_index.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"id": PERSONAL, "thread_name": "Old name"}),
+                json!({"id": PERSONAL, "thread_name": "Zebrafish thread"})
+            ),
+        )
+        .expect("session index");
+        home
+    }
+
+    fn run(home: &Path, args: &[&str], path_env: Option<&Path>) -> String {
+        let mut cmd = Command::new(binary_path());
+        cmd.arg("--codex")
+            .args(args)
+            .env("HOME", home)
+            .env_remove("CODEX_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR");
+        if let Some(path) = path_env {
+            cmd.env("PATH", path);
+        }
+        let output = cmd.output().expect("Failed to run binary");
+        assert!(
+            output.status.success(),
+            "exit {:?}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    fn rows(stdout: &str) -> Vec<serde_json::Value> {
+        stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("jsonl row"))
+            .collect()
+    }
+
+    fn ids(stdout: &str) -> Vec<String> {
+        rows(stdout)
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn finds_typed_prompts_in_every_codex_root_newest_first() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = run(home.path(), &["zebrafish", "--format", "jsonl"], None);
+
+        assert_eq!(ids(&stdout), [PERSONAL, WORK, OLDER], "{stdout}");
+    }
+
+    #[test]
+    fn harness_injected_and_developer_text_is_not_a_hit() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = run(home.path(), &["quokka", "--format", "jsonl"], None);
+
+        assert!(stdout.is_empty(), "matched harness text:\n{stdout}");
+    }
+
+    #[test]
+    fn project_filter_matches_the_session_cwd() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = run(
+            home.path(),
+            &["zebrafish", "--project", "billing-api", "--format", "jsonl"],
+            None,
+        );
+
+        assert_eq!(ids(&stdout), [WORK], "{stdout}");
+    }
+
+    #[test]
+    fn jsonl_row_carries_provenance_and_thread_name() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = run(
+            home.path(),
+            &["zebrafish", "--format", "jsonl", "--limit", "1"],
+            None,
+        );
+        let row = &rows(&stdout)[0];
+
+        assert_eq!(row["session_id"], PERSONAL);
+        assert_eq!(row["message_type"], "user");
+        assert_eq!(row["record_line"], 4);
+        assert_eq!(row["summary"], "Zebrafish thread");
+        assert!(row["config_root"].as_str().unwrap().ends_with("/.codex"));
+        assert!(row["transcript_path"].as_str().unwrap().ends_with(&format!(
+            "sessions/2026/10/10/rollout-2026-10-10T10-00-00-{PERSONAL}.jsonl"
+        )));
+    }
+
+    #[test]
+    fn resume_line_names_codex_home_only_for_a_non_default_root() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = run(home.path(), &["zebrafish"], None);
+
+        assert!(
+            stdout.contains(&format!(
+                "Resume:   cd ~/dev/zoo && codex resume {PERSONAL}"
+            )),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "Resume:   cd ~/work/billing-api && CODEX_HOME=~/.codex-work codex resume {WORK}"
+            )),
+            "{stdout}"
+        );
+    }
+
+    #[test]
+    fn codex_home_outside_the_home_naming_is_searched() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        let custom = home.path().join("elsewhere");
+        write_rollout(
+            &custom,
+            "10",
+            PERSONAL,
+            home.path(),
+            "user",
+            "zebrafish custom",
+        );
+
+        let output = Command::new(binary_path())
+            .args(["--codex", "zebrafish", "--format", "jsonl"])
+            .env("HOME", home.path())
+            .env("CODEX_HOME", &custom)
+            .output()
+            .expect("Failed to run binary");
+
+        assert_eq!(ids(&String::from_utf8_lossy(&output.stdout)), [PERSONAL]);
+    }
+
+    #[test]
+    fn rust_fallback_returns_what_ripgrep_returns() {
+        ensure_binary_built();
+        let home = fake_home();
+        let no_rg = tempfile::tempdir().expect("tempdir");
+        let args = ["zebrafish", "--format", "jsonl"];
+
+        let with_rg = run(home.path(), &args, None);
+        let without_rg = run(home.path(), &args, Some(no_rg.path()));
+
+        assert_eq!(ids(&without_rg), ids(&with_rg));
+    }
+}
+
 mod index_parsing {
     use super::*;
 

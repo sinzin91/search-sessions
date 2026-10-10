@@ -10,7 +10,7 @@
 [![skills.sh](https://img.shields.io/badge/skills.sh-available-blue)](https://skills.sh)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Search across all your Claude Code and OpenClaw session history. Fast.
+Search across all your Claude Code, Codex and OpenClaw session history. Fast.
 
 ## Why?
 
@@ -112,6 +112,15 @@ No commands to memorize. No context switching.
 | cc-conversation-search | ~500ms | Python + SQLite | ❌ |
 | claude-history | ~400ms | Rust | ❌ TUI only |
 | aichat claude-code-tools | ~300ms | Python + Tantivy | ❌ |
+
+## Codex Support
+
+Searches Codex rollouts with `--codex`: every `~/.codex*/sessions` root (personal and work accounts) plus `$CODEX_HOME`, newest first. It matches what you typed and what Codex answered, never the AGENTS.md or environment text Codex injects, and skips subagent threads. Each hit prints a `codex resume` command, with `CODEX_HOME=` set when the session lives outside the default home.
+
+```bash
+search-sessions "helm upgrade" --codex
+search-sessions "acl" --codex --project myapp --format jsonl
+```
 
 ## OpenClaw Support
 
