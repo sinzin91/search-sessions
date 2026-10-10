@@ -73,6 +73,9 @@ search-sessions "kubernetes RBAC"
 # Deep search (searches full message content)
 search-sessions "docker compose" --deep
 
+# Machine-readable deep hits with exact transcript provenance
+search-sessions "not what I asked" --deep --format jsonl
+
 # Filter by project
 search-sessions "auth" --project myapp
 
