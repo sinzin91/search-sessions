@@ -6,8 +6,8 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeDelta, Utc};
-use clap::Parser;
-use serde::Deserialize;
+use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -61,10 +61,21 @@ struct Cli {
     /// Shorthand for --since <date> --until <date+1day> (e.g. "today", "2026-02-20")
     #[arg(long)]
     date: Option<String>,
+
+    /// Output format (text for humans, jsonl for automation)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Jsonl,
 }
 
 // ─── Data Structures ────────────────────────────────────────────────
 
+#[derive(Serialize)]
 struct IndexMatch {
     session_id: String,
     project_path: String,
@@ -78,6 +89,7 @@ struct IndexMatch {
     score: f64,
 }
 
+#[derive(Serialize)]
 struct DeepMatch {
     session_id: String,
     project_path: String,
@@ -86,6 +98,10 @@ struct DeepMatch {
     timestamp: String,
     summary: Option<String>,
     first_prompt: Option<String>,
+    transcript_path: String,
+    config_root: String,
+    record_line: usize,
+    record_uuid: String,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +141,7 @@ struct OpenClawSessionMeta {
 }
 
 /// Obsidian search result
+#[derive(Serialize)]
 struct ObsidianMatch {
     file_path: PathBuf,
     file_name: String,
@@ -730,15 +747,29 @@ fn build_index_lookup(base: &Path) -> HashMap<String, SessionIndexEntry> {
 }
 
 /// Parse a single ripgrep output line: /path/to/file.jsonl:LINE_NUM:json_content
-fn parse_rg_line(line: &str) -> Option<(PathBuf, serde_json::Value)> {
+fn parse_rg_line(line: &str) -> Option<(PathBuf, usize, serde_json::Value)> {
     // Split on first two colons
     let first_colon = line.find(':')?;
     let path = PathBuf::from(&line[..first_colon]);
     let rest = &line[first_colon + 1..];
     let second_colon = rest.find(':')?;
+    let line_number = rest[..second_colon].parse().ok()?;
     let json_str = &rest[second_colon + 1..];
     let value = serde_json::from_str(json_str).ok()?;
-    Some((path, value))
+    Some((path, line_number, value))
+}
+
+fn config_root_for_projects(base: &Path) -> String {
+    base.parent().unwrap_or(base).to_string_lossy().into_owned()
+}
+
+fn record_uuid(record: &serde_json::Value) -> String {
+    record
+        .get("uuid")
+        .or_else(|| record.get("id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Extract session ID from file path (OpenClaw: filename is session ID)
@@ -981,7 +1012,7 @@ fn search_deep_claude_rust(
         };
         let reader = BufReader::new(file);
 
-        for line in reader.lines() {
+        for (line_index, line) in reader.lines().enumerate() {
             if matches.len() >= limit {
                 break 'outer;
             }
@@ -1049,6 +1080,10 @@ fn search_deep_claude_rust(
                 timestamp,
                 summary: index_entry.map(|e| e.summary.clone()),
                 first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+                transcript_path: file_path.to_string_lossy().into_owned(),
+                config_root: config_root_for_projects(base),
+                record_line: line_index + 1,
+                record_uuid: record_uuid(&record),
             });
 
             *count += 1;
@@ -1083,7 +1118,7 @@ fn search_deep_openclaw_rust(
         let reader = BufReader::new(file);
         let session_id = session_id_from_path(&file_path);
 
-        for line in reader.lines() {
+        for (line_index, line) in reader.lines().enumerate() {
             if matches.len() >= limit {
                 break 'outer;
             }
@@ -1148,6 +1183,10 @@ fn search_deep_openclaw_rust(
                 timestamp,
                 summary: None,
                 first_prompt: None,
+                transcript_path: file_path.to_string_lossy().into_owned(),
+                config_root: base.to_string_lossy().into_owned(),
+                record_line: line_index + 1,
+                record_uuid: record_uuid(&record),
             });
 
             *count += 1;
@@ -1221,7 +1260,7 @@ fn search_deep_claude(
             break;
         }
 
-        let (path, record) = match parse_rg_line(line) {
+        let (path, record_line, record) = match parse_rg_line(line) {
             Some(r) => r,
             None => continue,
         };
@@ -1283,6 +1322,10 @@ fn search_deep_claude(
             timestamp,
             summary: index_entry.map(|e| e.summary.clone()),
             first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+            transcript_path: path.to_string_lossy().into_owned(),
+            config_root: config_root_for_projects(base),
+            record_line,
+            record_uuid: record_uuid(&record),
         });
 
         *count += 1;
@@ -1350,7 +1393,7 @@ fn search_deep_openclaw(
             break;
         }
 
-        let (path, record) = match parse_rg_line(line) {
+        let (path, record_line, record) = match parse_rg_line(line) {
             Some(r) => r,
             None => continue,
         };
@@ -1414,6 +1457,10 @@ fn search_deep_openclaw(
             timestamp,
             summary: None,
             first_prompt: None,
+            transcript_path: path.to_string_lossy().into_owned(),
+            config_root: base.to_string_lossy().into_owned(),
+            record_line,
+            record_uuid: record_uuid(&record),
         });
 
         *count += 1;
@@ -1683,6 +1730,18 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
     println!("{sep}\n");
 }
 
+fn print_jsonl<T: Serialize>(matches: &[T], limit: usize) {
+    for item in matches.iter().take(limit) {
+        match serde_json::to_string(item) {
+            Ok(line) => println!("{line}"),
+            Err(error) => {
+                eprintln!("ERROR: failed to serialize search result: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openclaw: bool) {
     let total = matches.len();
     let displayed = &matches[..total.min(limit)];
@@ -1818,7 +1877,11 @@ fn main() {
         }
 
         let matches = search_obsidian(&query, cli.limit, vault_path);
-        print_obsidian_results(&matches, &query, cli.limit, vault_path);
+        if matches!(cli.format, OutputFormat::Jsonl) {
+            print_jsonl(&matches, cli.limit);
+        } else {
+            print_obsidian_results(&matches, &query, cli.limit, vault_path);
+        }
     } else if cli.openclaw {
         // OpenClaw mode
         let base = openclaw_sessions_dir(&cli.agent);
@@ -1837,7 +1900,11 @@ fn main() {
         }
 
         let matches = search_deep_openclaw(&query, cli.limit, &base, &date_range);
-        print_deep_results(&matches, &query, cli.limit, true);
+        if matches!(cli.format, OutputFormat::Jsonl) {
+            print_jsonl(&matches, cli.limit);
+        } else {
+            print_deep_results(&matches, &query, cli.limit, true);
+        }
     } else {
         // Claude Code mode. Transcripts are split across config roots
         // (~/.claude, ~/.claude-work, ...), so every root is searched and the
@@ -1879,7 +1946,11 @@ fn main() {
                     break;
                 }
             }
-            print_deep_results(&matches, &query, cli.limit, false);
+            if matches!(cli.format, OutputFormat::Jsonl) {
+                print_jsonl(&matches, cli.limit);
+            } else {
+                print_deep_results(&matches, &query, cli.limit, false);
+            }
         } else {
             let mut matches = Vec::new();
             for base in &bases {
@@ -1893,7 +1964,11 @@ fn main() {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.modified.cmp(&a.modified))
             });
-            print_index_results(&matches, &query, cli.limit);
+            if matches!(cli.format, OutputFormat::Jsonl) {
+                print_jsonl(&matches, cli.limit);
+            } else {
+                print_index_results(&matches, &query, cli.limit);
+            }
         }
     }
 }

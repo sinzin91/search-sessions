@@ -118,6 +118,26 @@ mod multi_config_root {
              match must be skipped, not searched wholesale:\n{stdout}"
         );
     }
+
+    #[test]
+    fn jsonl_deep_search_exposes_exact_source_provenance() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = search(
+            home.path(),
+            &["zebrafish", "--deep", "--format", "jsonl", "--limit", "1"],
+        );
+        let row: serde_json::Value = serde_json::from_str(stdout.trim())
+            .expect("--format jsonl must emit one JSON object per result");
+
+        assert_eq!(row["session_id"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(row["record_line"], 1);
+        assert_eq!(row["message_type"], "user");
+        assert!(row["transcript_path"].as_str().unwrap().ends_with(
+            ".claude/projects/-home-user-personal/11111111-1111-1111-1111-111111111111.jsonl"
+        ));
+        assert!(row["config_root"].as_str().unwrap().ends_with(".claude"));
+    }
 }
 
 mod index_parsing {
