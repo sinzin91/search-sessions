@@ -19,6 +19,107 @@ fn ensure_binary_built() {
     assert!(status.success(), "Binary build failed");
 }
 
+/// Claude Code splits transcripts across sibling config roots (~/.claude for
+/// personal, ~/.claude-work or another overlay for work accounts). Searching
+/// only ~/.claude returns nothing for the other accounts, which a user reads as
+/// "that conversation does not exist" rather than "I did not look there".
+mod multi_config_root {
+    use super::*;
+
+    fn write_session(root: &std::path::Path, project: &str, session: &str, text: &str) {
+        let dir = root.join("projects").join(project);
+        fs::create_dir_all(&dir).expect("create project dir");
+        let line = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\
+             \"timestamp\":\"2026-02-01T10:00:00Z\",\
+             \"message\":{{\"role\":\"user\",\"content\":\
+             [{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+        );
+        fs::write(dir.join(format!("{session}.jsonl")), line).expect("write session");
+    }
+
+    /// Builds a synthetic home with a personal and a work root. Returns the
+    /// tempdir, which must stay alive for the duration of the test.
+    fn fake_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_session(
+            &home.path().join(".claude"),
+            "-home-user-personal",
+            "11111111-1111-1111-1111-111111111111",
+            "personal transcript about zebrafish migration",
+        );
+        write_session(
+            &home.path().join(".claude-work"),
+            "-home-user-work-api",
+            "22222222-2222-2222-2222-222222222222",
+            "work transcript about zebrafish migration",
+        );
+        home
+    }
+
+    fn search(home: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new(binary_path())
+            .args(args)
+            .env("HOME", home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .output()
+            .expect("Failed to run binary");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    #[test]
+    fn deep_search_reaches_both_personal_and_work_roots() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = search(home.path(), &["zebrafish", "--deep", "--limit", "10"]);
+
+        assert!(
+            stdout.contains("11111111-1111-1111-1111-111111111111"),
+            "personal root missing from results:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("22222222-2222-2222-2222-222222222222"),
+            "work root missing from results; searching only ~/.claude \
+             silently hides an entire account:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn a_low_limit_does_not_let_one_root_starve_the_others() {
+        ensure_binary_built();
+        let home = fake_home();
+        // One result per root is exactly enough to expose concatenation:
+        // a plain extend() would return two hits from the first root.
+        let stdout = search(home.path(), &["zebrafish", "--deep", "--limit", "2"]);
+
+        assert!(
+            stdout.contains("11111111-1111-1111-1111-111111111111")
+                && stdout.contains("22222222-2222-2222-2222-222222222222"),
+            "both roots should be represented at --limit 2:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn project_filter_matches_a_project_that_exists_only_in_the_work_root() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = search(
+            home.path(),
+            &["zebrafish", "--deep", "--project", "work-api"],
+        );
+
+        assert!(
+            stdout.contains("22222222-2222-2222-2222-222222222222"),
+            "--project must resolve across every root, not just the first:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("11111111-1111-1111-1111-111111111111"),
+            "--project must still exclude non-matching projects; a root with no \
+             match must be skipped, not searched wholesale:\n{stdout}"
+        );
+    }
+}
+
 mod index_parsing {
     use super::*;
 

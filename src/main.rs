@@ -134,11 +134,57 @@ struct ObsidianMatch {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-fn claude_projects_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("Cannot determine home directory")
-        .join(".claude")
-        .join("projects")
+/// Every Claude config root on this machine that holds a projects/ tree.
+///
+/// Claude Code supports account isolation via CLAUDE_CONFIG_DIR, so transcripts
+/// are split across sibling roots: ~/.claude for personal, ~/.claude-work (or
+/// any other overlay) for work. Searching only ~/.claude silently returns
+/// nothing for half the corpus, which reads as "that conversation does not
+/// exist" rather than "I did not look there".
+///
+/// Discovery is by shape, not by a hardcoded list: any ~/.claude* directory
+/// with a projects/ subdirectory counts, so a new overlay is picked up without
+/// a code change. CLAUDE_CONFIG_DIR is honoured explicitly in case it points
+/// outside the home directory.
+fn claude_projects_dirs() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push = |dir: PathBuf| {
+        if dir.is_dir() && !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    };
+
+    if let Ok(configured) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !configured.is_empty()
+    {
+        push(PathBuf::from(configured).join("projects"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        push(home.join(".claude").join("projects"));
+
+        if let Ok(entries) = fs::read_dir(&home) {
+            let mut siblings: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".claude"))
+                })
+                .map(|path| path.join("projects"))
+                .filter(|path| path.is_dir())
+                .collect();
+            // read_dir order is filesystem-dependent; sort so results are
+            // reproducible across runs and machines.
+            siblings.sort();
+            for sibling in siblings {
+                push(sibling);
+            }
+        }
+    }
+
+    roots
 }
 
 fn openclaw_sessions_dir(agent: &str) -> PathBuf {
@@ -512,24 +558,40 @@ fn search_index(
 
 // ─── Deep Search ────────────────────────────────────────────────────
 
-fn resolve_search_path(base: &Path, project_filter: Option<&str>) -> PathBuf {
-    if let Some(filter) = project_filter {
-        let filter_lower = filter.to_lowercase();
-        if let Ok(entries) = fs::read_dir(base) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir()
-                    && entry
-                        .file_name()
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&filter_lower)
-                {
-                    return entry.path();
-                }
-            }
-        }
-    }
-    base.to_path_buf()
+/// Directories to search within one config root for a given --project filter.
+///
+/// Returns EVERY matching project directory, not the first. One project
+/// routinely has several encoded directories (a repo plus its worktrees, e.g.
+/// -home-user-myapp and
+/// -home-user-myapp--claude-worktrees-feature-x), and
+/// returning only the first hid whichever came later in readdir order.
+///
+/// An empty result means the filter matched nothing in THIS root, which is
+/// normal when a project lives only under another account. Callers skip the
+/// root rather than falling back to searching all of it, since that fallback
+/// silently widens a narrow query into a whole-account scan.
+fn resolve_search_paths(base: &Path, project_filter: Option<&str>) -> Vec<PathBuf> {
+    let Some(filter) = project_filter else {
+        return vec![base.to_path_buf()];
+    };
+
+    let filter_lower = filter.to_lowercase();
+    let mut paths: Vec<PathBuf> = match fs::read_dir(base) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_lowercase().contains(&filter_lower))
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // readdir order is filesystem-dependent; sort for reproducible results.
+    paths.sort();
+    paths
 }
 
 /// Extract text from Claude Code message format
@@ -897,12 +959,18 @@ fn search_deep_claude_rust(
 ) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
-    let search_path = resolve_search_path(base, project_filter);
+    let search_paths = resolve_search_paths(base, project_filter);
+    if search_paths.is_empty() {
+        return Vec::new();
+    }
     let query_terms_lower: Vec<String> =
         query.split_whitespace().map(|s| s.to_lowercase()).collect();
     let index_lookup = build_index_lookup(base);
 
-    let jsonl_files = find_jsonl_files(&search_path, true, false);
+    let jsonl_files: Vec<PathBuf> = search_paths
+        .iter()
+        .flat_map(|path| find_jsonl_files(path, true, false))
+        .collect();
 
     let mut matches = Vec::new();
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
@@ -1101,7 +1169,10 @@ fn search_deep_claude(
         return search_deep_claude_rust(query, limit, project_filter, base, date_range);
     }
 
-    let search_path = resolve_search_path(base, project_filter);
+    let search_paths = resolve_search_paths(base, project_filter);
+    if search_paths.is_empty() {
+        return Vec::new();
+    }
     // Pre-lowercase query terms to avoid repeated allocations
     let query_terms_lower: Vec<String> =
         query.split_whitespace().map(|s| s.to_lowercase()).collect();
@@ -1120,7 +1191,7 @@ fn search_deep_claude(
             "!**/sessions-index.json",
             query,
         ])
-        .arg(&search_path)
+        .args(&search_paths)
         .output();
 
     let output = match output {
@@ -1768,12 +1839,14 @@ fn main() {
         let matches = search_deep_openclaw(&query, cli.limit, &base, &date_range);
         print_deep_results(&matches, &query, cli.limit, true);
     } else {
-        // Claude Code mode
-        let base = claude_projects_dir();
-        if !base.exists() {
+        // Claude Code mode. Transcripts are split across config roots
+        // (~/.claude, ~/.claude-work, ...), so every root is searched and the
+        // results merged; searching only one silently hides whole accounts.
+        let bases = claude_projects_dirs();
+        if bases.is_empty() {
             eprintln!(
-                "ERROR: Claude projects directory not found: {}",
-                base.display()
+                "ERROR: no Claude projects directory found under {}",
+                dirs::home_dir().unwrap_or_default().display()
             );
             std::process::exit(1);
         }
@@ -1781,10 +1854,45 @@ fn main() {
         let project_filter = cli.project.as_deref();
 
         if cli.deep {
-            let matches = search_deep_claude(&query, cli.limit, project_filter, &base, &date_range);
+            let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> = bases
+                .iter()
+                .map(|base| {
+                    search_deep_claude(&query, cli.limit, project_filter, base, &date_range)
+                        .into_iter()
+                })
+                .collect();
+            // Deep matches carry no comparable score (ripgrep returns file
+            // order), so a plain concatenation lets the first root consume the
+            // whole limit and hide every other account. Round-robin instead, so
+            // a low --limit shows a spread across accounts rather than only the
+            // alphabetically-first one.
+            let mut matches = Vec::new();
+            loop {
+                let mut progressed = false;
+                for root in per_root.iter_mut() {
+                    if let Some(hit) = root.next() {
+                        matches.push(hit);
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
             print_deep_results(&matches, &query, cli.limit, false);
         } else {
-            let matches = search_index(&query, project_filter, &base, &date_range);
+            let mut matches = Vec::new();
+            for base in &bases {
+                matches.extend(search_index(&query, project_filter, base, &date_range));
+            }
+            // Each root sorted its own results; re-sort so the merged list is
+            // ranked globally rather than grouped by which root it came from.
+            matches.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.modified.cmp(&a.modified))
+            });
             print_index_results(&matches, &query, cli.limit);
         }
     }
