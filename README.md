@@ -83,6 +83,10 @@ search-sessions "bug" --date today
 search-sessions "refactor" --since "last week"
 ```
 
+**Multiple accounts.** If you keep accounts in separate config roots with `CLAUDE_CONFIG_DIR` (for example `~/.claude` and `~/.claude-work`), every `~/.claude*/projects` directory and `$CLAUDE_CONFIG_DIR/projects` is searched and the results are merged. For a session from a root that `claude` doesn't read by default, the `Resume` command sets `CLAUDE_CONFIG_DIR` for you.
+
+**`--project` with deep search** searches every project directory whose name matches (a repo and its worktrees). If nothing matches in a config root, that root is skipped; earlier versions fell back to searching the whole root.
+
 ## Speed
 
 | Mode | Time |
