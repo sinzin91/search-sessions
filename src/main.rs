@@ -76,7 +76,7 @@ struct IndexMatch {
     message_count: u64,
     matched_field: String,
     score: f64,
-    session_file: PathBuf,
+    session_file: Option<PathBuf>,
     custom_title: Option<String>,
 }
 
@@ -498,7 +498,7 @@ fn search_index(
                     message_count: entry.message_count,
                     matched_field,
                     score,
-                    session_file: index_path.with_file_name(format!("{}.jsonl", entry.session_id)),
+                    session_file: index_session_file(&index_path, &entry.session_id),
                     custom_title: None,
                 });
             }
@@ -675,15 +675,21 @@ fn build_index_lookup(base: &Path) -> HashMap<String, SessionIndexEntry> {
 /// Read a session's user-assigned title from its transcript. Claude Code
 /// appends a `custom-title` record on each rename, so the last one wins.
 fn read_custom_title(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(File::open(path).ok()?);
     let mut title = None;
-    // Stop at the first read error: a persistent one would repeat forever
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Stop at the first read error: a persistent one would repeat forever
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
         // Cheap pre-check so ordinary message lines are never parsed
-        if !line.contains("custom-title") {
+        if !line.windows(12).any(|w| w == b"custom-title") {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
         if record.get("type").and_then(|t| t.as_str()) == Some("custom-title")
@@ -696,6 +702,15 @@ fn read_custom_title(path: &Path) -> Option<String> {
         }
     }
     title
+}
+
+/// Transcript path for an index entry. Session IDs come from the index file,
+/// so only accept a bare file name that cannot point outside the project dir.
+fn index_session_file(index_path: &Path, session_id: &str) -> Option<PathBuf> {
+    if Path::new(session_id).file_name() != Some(session_id.as_ref()) {
+        return None;
+    }
+    Some(index_path.with_file_name(format!("{session_id}.jsonl")))
 }
 
 /// Read each transcript's title at most once per search
@@ -1841,9 +1856,8 @@ fn main() {
             let mut matches = search_index(&query, project_filter, &base, &date_range);
             // Titles live in the transcripts, so only read them for displayed results
             for m in matches.iter_mut().take(cli.limit) {
-                // Session IDs come from the index; never let one point outside its project dir
-                if !m.session_id.contains(['/', '\\']) {
-                    m.custom_title = read_custom_title(&m.session_file);
+                if let Some(path) = &m.session_file {
+                    m.custom_title = read_custom_title(path);
                 }
             }
             print_index_results(&matches, &query, cli.limit);

@@ -531,9 +531,12 @@ mod custom_title_cli {
     }
 
     /// The `Label:` line printed directly under the result whose header contains `header`.
+    /// Panics if no such result was printed, so `None` always means "no label".
     fn label_for<'a>(stdout: &'a str, header: &str) -> Option<&'a str> {
         let mut lines = stdout.lines().skip_while(|l| !l.contains(header));
-        lines.next()?;
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("no result {header:?} in: {stdout}"));
         lines
             .next()
             .and_then(|l| l.trim().strip_prefix("Label:"))
@@ -569,6 +572,50 @@ mod custom_title_cli {
         );
         assert!(!stdout.contains("First title"));
         assert!(!stdout.contains("Decoy title"));
+    }
+
+    #[test]
+    fn test_index_search_ignores_session_id_outside_project_dir() {
+        let home = fake_home(
+            &[index_entry(
+                "../-other-project/titled-session",
+                "Zephyr widget setup",
+                "2026-03-01T09:00:30Z",
+            )],
+            &[],
+        );
+        let other = home.path().join(".claude/projects/-other-project");
+        fs::create_dir_all(&other).unwrap();
+        fs::copy(
+            fixtures_dir().join("custom-title-session.jsonl"),
+            other.join("titled-session.jsonl"),
+        )
+        .unwrap();
+
+        let stdout = run(home.path(), &["zephyr", "widget"]);
+
+        assert_eq!(label_for(&stdout, "Zephyr widget setup"), None);
+    }
+
+    #[test]
+    fn test_custom_title_survives_invalid_utf8_line() {
+        let home = default_home();
+        let transcript = home
+            .path()
+            .join(".claude/projects")
+            .join(PROJECT_DIR)
+            .join("titled-session.jsonl");
+        let mut bytes = b"{\"type\":\"user\",\"text\":\"\xff\xfe\"}\n".to_vec();
+        bytes.extend(fs::read(&transcript).unwrap());
+        fs::write(&transcript, bytes).unwrap();
+
+        let stdout = run(home.path(), &["zephyr", "widget"]);
+
+        assert_eq!(
+            label_for(&stdout, "Zephyr widget setup"),
+            Some("Final title"),
+            "got: {stdout}"
+        );
     }
 
     /// An empty PATH hides ripgrep, forcing the pure-Rust deep search
