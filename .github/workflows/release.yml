@@ -74,12 +74,8 @@ jobs:
       - name: Create checksums
         run: |
           cd artifacts
-          for dir in */; do
-            cd "$dir"
-            sha256sum *.tar.gz > SHA256SUMS.txt
-            cat SHA256SUMS.txt
-            cd ..
-          done
+          sha256sum */*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -87,7 +83,7 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz
-            artifacts/**/SHA256SUMS.txt
+            artifacts/SHA256SUMS.txt
 
   publish-crate:
     name: Publish to crates.io
