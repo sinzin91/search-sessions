@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"untitled-session","cwd":"/home/user/projects/zephyr","timestamp":"2026-03-02T09:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Tear down the zephyr widget"}]}}
+{"type":"assistant","sessionId":"untitled-session","cwd":"/home/user/projects/zephyr","timestamp":"2026-03-02T09:00:30Z","message":{"role":"assistant","content":[{"type":"text","text":"The zephyr widget has been torn down."}]}}

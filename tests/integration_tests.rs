@@ -449,3 +449,210 @@ mod obsidian_search {
         );
     }
 }
+
+mod custom_title_cli {
+    use super::*;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    const PROJECT_DIR: &str = "-home-user-projects-zephyr";
+
+    fn index_entry(session_id: &str, summary: &str, modified: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": session_id,
+            "firstPrompt": "zephyr widget",
+            "summary": summary,
+            "messageCount": 2,
+            "created": modified,
+            "modified": modified,
+            "gitBranch": "main",
+            "projectPath": "/home/user/projects/zephyr"
+        })
+    }
+
+    /// Lay out a fake `$HOME/.claude/projects/<project>/` with an index and
+    /// the given session transcripts copied from fixtures.
+    fn fake_home(entries: &[serde_json::Value], sessions: &[(&str, &str)]) -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("Failed to create temp HOME");
+        let project = home.path().join(".claude/projects").join(PROJECT_DIR);
+        fs::create_dir_all(&project).unwrap();
+
+        let index = serde_json::json!({
+            "originalPath": "/home/user/projects/zephyr",
+            "entries": entries,
+        });
+        fs::write(project.join("sessions-index.json"), index.to_string()).unwrap();
+
+        for (session_id, fixture) in sessions {
+            fs::copy(
+                fixtures_dir().join(fixture),
+                project.join(format!("{session_id}.jsonl")),
+            )
+            .unwrap();
+        }
+        home
+    }
+
+    fn default_home() -> tempfile::TempDir {
+        fake_home(
+            &[
+                index_entry(
+                    "titled-session",
+                    "Zephyr widget setup",
+                    "2026-03-01T09:00:30Z",
+                ),
+                index_entry(
+                    "untitled-session",
+                    "Zephyr widget teardown",
+                    "2026-03-02T09:00:30Z",
+                ),
+            ],
+            &[
+                ("titled-session", "custom-title-session.jsonl"),
+                ("untitled-session", "untitled-session.jsonl"),
+            ],
+        )
+    }
+
+    fn run(home: &Path, args: &[&str]) -> String {
+        run_with_path(home, args, &std::env::var_os("PATH").unwrap_or_default())
+    }
+
+    fn run_with_path(home: &Path, args: &[&str], path: &std::ffi::OsStr) -> String {
+        ensure_binary_built();
+        let output = Command::new(binary_path())
+            .args(args)
+            .env("HOME", home)
+            .env("PATH", path)
+            .output()
+            .expect("Failed to run binary");
+        assert!(output.status.success(), "binary failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The `Label:` line printed directly under the result whose header contains `header`.
+    fn label_for<'a>(stdout: &'a str, header: &str) -> Option<&'a str> {
+        let mut lines = stdout.lines().skip_while(|l| !l.contains(header));
+        lines.next()?;
+        lines
+            .next()
+            .and_then(|l| l.trim().strip_prefix("Label:"))
+            .map(str::trim)
+    }
+
+    #[test]
+    fn test_index_search_shows_last_custom_title() {
+        let home = default_home();
+        let stdout = run(home.path(), &["zephyr", "widget"]);
+
+        assert!(stdout.contains("2 matches found"), "got: {stdout}");
+        assert_eq!(
+            label_for(&stdout, "Zephyr widget setup"),
+            Some("Final title"),
+            "got: {stdout}"
+        );
+        assert_eq!(label_for(&stdout, "Zephyr widget teardown"), None);
+        assert!(!stdout.contains("First title"));
+        assert!(!stdout.contains("Decoy title"));
+    }
+
+    #[test]
+    fn test_deep_search_shows_last_custom_title() {
+        let home = default_home();
+        let stdout = run(home.path(), &["--deep", "configured"]);
+
+        assert!(stdout.contains("1 matches found"), "got: {stdout}");
+        assert_eq!(
+            label_for(&stdout, "Zephyr widget setup"),
+            Some("Final title"),
+            "got: {stdout}"
+        );
+        assert!(!stdout.contains("First title"));
+        assert!(!stdout.contains("Decoy title"));
+    }
+
+    /// An empty PATH hides ripgrep, forcing the pure-Rust deep search
+    #[test]
+    fn test_deep_search_rust_fallback_shows_last_custom_title() {
+        let home = default_home();
+        let empty_path = tempfile::tempdir().unwrap();
+        let stdout = run_with_path(
+            home.path(),
+            &["--deep", "configured"],
+            empty_path.path().as_os_str(),
+        );
+
+        assert!(stdout.contains("1 matches found"), "got: {stdout}");
+        assert_eq!(
+            label_for(&stdout, "Zephyr widget setup"),
+            Some("Final title"),
+            "got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn test_deep_search_session_without_title_has_no_label() {
+        let home = default_home();
+        let stdout = run(home.path(), &["--deep", "torn", "down"]);
+
+        assert!(stdout.contains("1 matches found"), "got: {stdout}");
+        assert_eq!(label_for(&stdout, "Zephyr widget teardown"), None);
+        assert!(!stdout.contains("Label:"), "got: {stdout}");
+    }
+
+    /// Index mode must only open transcripts for the results it displays.
+    /// The non-displayed session's transcript is a FIFO with no writer, so
+    /// opening it by path would block the binary forever.
+    #[cfg(unix)]
+    #[test]
+    fn test_index_search_does_not_read_undisplayed_transcripts() {
+        let home = fake_home(
+            &[
+                index_entry(
+                    "titled-session",
+                    "Zephyr widget setup",
+                    "2026-03-02T09:00:30Z",
+                ),
+                index_entry(
+                    "fifo-session",
+                    "Zephyr widget setup",
+                    "2026-03-01T09:00:30Z",
+                ),
+            ],
+            &[("titled-session", "custom-title-session.jsonl")],
+        );
+        let fifo = home
+            .path()
+            .join(".claude/projects")
+            .join(PROJECT_DIR)
+            .join("fifo-session.jsonl");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success(), "mkfifo failed");
+
+        ensure_binary_built();
+        let mut child = Command::new(binary_path())
+            .args(["--limit", "1", "zephyr", "widget"])
+            .env("HOME", home.path())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("Failed to run binary");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                child.kill().unwrap();
+                panic!("index search blocked opening an undisplayed transcript");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("showing top 1"), "got: {stdout}");
+        assert_eq!(
+            label_for(&stdout, "Zephyr widget setup"),
+            Some("Final title"),
+            "got: {stdout}"
+        );
+    }
+}

@@ -1,0 +1,5 @@
+{"type":"user","sessionId":"titled-session","cwd":"/home/user/projects/zephyr","timestamp":"2026-03-01T09:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Configure the zephyr widget"}]}}
+{"type":"custom-title","customTitle":"First title","sessionId":"titled-session"}
+{"type":"assistant","sessionId":"titled-session","cwd":"/home/user/projects/zephyr","timestamp":"2026-03-01T09:00:30Z","message":{"role":"assistant","content":[{"type":"text","text":"The zephyr widget is now configured."}]}}
+{"type":"custom-title","customTitle":"Final title","sessionId":"titled-session"}
+{"type":"summary","summary":"custom-title","customTitle":"Decoy title","sessionId":"titled-session"}
