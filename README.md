@@ -73,6 +73,9 @@ search-sessions "kubernetes RBAC"
 # Deep search (searches full message content)
 search-sessions "docker compose" --deep
 
+# Machine-readable deep hits with exact transcript provenance
+search-sessions "not what I asked" --deep --format jsonl
+
 # Filter by project
 search-sessions "auth" --project myapp
 
@@ -82,6 +85,12 @@ search-sessions "auth" --since 2026-02-01 --until 2026-02-15
 search-sessions "bug" --date today
 search-sessions "refactor" --since "last week"
 ```
+
+**Multiple accounts.** If you keep accounts in separate config roots with `CLAUDE_CONFIG_DIR` (for example `~/.claude` and `~/.claude-work`), every `~/.claude*/projects` directory and `$CLAUDE_CONFIG_DIR/projects` is searched and the results are merged. For a session from a root that `claude` doesn't read by default, the `Resume` command sets `CLAUDE_CONFIG_DIR` for you.
+
+**`--format jsonl`** prints one JSON object per result. `kind` names the shape: `index`, `deep`, `openclaw` or `obsidian`. Claude Code rows carry `config_root`, the config dir to resume the session in, and `transcript_path` (null if an index lists a transcript that is gone). Deep rows also carry `record_line` and `record_uuid` (null when the record has none). OpenClaw rows carry `sessions_root` instead of `config_root`. When the only matching copy of a session is in a backup root, its `transcript_path` points into the backup while `config_root` names the live one.
+
+**`--project` with deep search** searches every project directory whose name matches (a repo and its worktrees). If nothing matches in a config root, that root is skipped; earlier versions fell back to searching the whole root.
 
 ## Speed
 
