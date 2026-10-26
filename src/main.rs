@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeDelta, Utc};
-use clap::Parser;
-use serde::Deserialize;
+use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ const MAX_MATCHES_PER_SESSION: usize = 2;
 #[derive(Parser)]
 #[command(
     name = "search-sessions",
-    about = "Search Claude Code, OpenClaw session history, or Obsidian vaults"
+    about = "Search Claude Code, Codex, OpenClaw session history, or Obsidian vaults"
 )]
 struct Cli {
     /// Search query (words are ANDed together)
@@ -33,6 +33,10 @@ struct Cli {
     /// Search OpenClaw sessions instead of Claude Code
     #[arg(long)]
     openclaw: bool,
+
+    /// Search Codex sessions (every ~/.codex*/sessions and $CODEX_HOME) instead of Claude Code
+    #[arg(long, conflicts_with_all = ["openclaw", "obsidian"])]
+    codex: bool,
 
     /// Search an Obsidian vault directory
     #[arg(long)]
@@ -61,10 +65,21 @@ struct Cli {
     /// Shorthand for --since <date> --until <date+1day> (e.g. "today", "2026-02-20")
     #[arg(long)]
     date: Option<String>,
+
+    /// Output format (text for humans, jsonl for automation)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Jsonl,
 }
 
 // ─── Data Structures ────────────────────────────────────────────────
 
+#[derive(Serialize)]
 struct IndexMatch {
     session_id: String,
     project_path: String,
@@ -76,10 +91,17 @@ struct IndexMatch {
     message_count: u64,
     matched_field: String,
     score: f64,
+    #[serde(rename = "transcript_path", serialize_with = "lossy_path")]
     session_file: Option<PathBuf>,
     custom_title: Option<String>,
+    /// Claude config dir the session resumes in
+    config_root: String,
+    /// Set when the session lives outside the root `claude` reads by default
+    #[serde(skip)]
+    config_dir: Option<PathBuf>,
 }
 
+#[derive(Serialize)]
 struct DeepMatch {
     session_id: String,
     project_path: String,
@@ -89,6 +111,19 @@ struct DeepMatch {
     summary: Option<String>,
     first_prompt: Option<String>,
     custom_title: Option<String>,
+    /// Set when the session lives outside the root `claude` reads by default
+    #[serde(skip)]
+    config_dir: Option<PathBuf>,
+    /// Transcript holding the matched record
+    transcript_path: String,
+    /// Claude config dir the session resumes in (Claude Code hits only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_root: Option<String>,
+    /// OpenClaw sessions dir searched (OpenClaw hits only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions_root: Option<String>,
+    record_line: usize,
+    record_uuid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +162,57 @@ struct OpenClawSessionMeta {
     timestamp: String,
 }
 
+/// Codex thread metadata from the session_meta record that opens each rollout
+struct CodexSessionMeta {
+    id: String,
+    cwd: String,
+    is_subagent: bool,
+}
+
+/// Which harness a deep search read, for the header and the resume command
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    ClaudeCode,
+    Codex,
+    OpenClaw,
+}
+
+impl Source {
+    /// How to resume one of this harness's sessions, if it can be resumed
+    fn harness(self) -> Option<&'static Harness> {
+        match self {
+            Source::ClaudeCode => Some(&CLAUDE),
+            Source::Codex => Some(&CODEX),
+            Source::OpenClaw => None,
+        }
+    }
+}
+
+/// A harness that keeps one config root per account and resumes by session id
+struct Harness {
+    /// Env var naming the config root the harness reads
+    env_var: &'static str,
+    /// Config root under the home directory used when `env_var` is unset;
+    /// siblings that start with it are other accounts' roots
+    default_root: &'static str,
+    /// Command that resumes a session by id from the config root it reads
+    resume: &'static str,
+}
+
+const CLAUDE: Harness = Harness {
+    env_var: "CLAUDE_CONFIG_DIR",
+    default_root: ".claude",
+    resume: "claude -r",
+};
+
+const CODEX: Harness = Harness {
+    env_var: "CODEX_HOME",
+    default_root: ".codex",
+    resume: "codex resume",
+};
+
 /// Obsidian search result
+#[derive(Serialize)]
 struct ObsidianMatch {
     file_path: PathBuf,
     file_name: String,
@@ -137,11 +222,282 @@ struct ObsidianMatch {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-fn claude_projects_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("Cannot determine home directory")
-        .join(".claude")
-        .join("projects")
+/// Every Claude config root on this machine that holds a projects/ tree.
+///
+/// Claude Code supports account isolation via CLAUDE_CONFIG_DIR, so transcripts
+/// are split across sibling roots: ~/.claude for personal, ~/.claude-work (or
+/// any other overlay) for work. Searching only ~/.claude silently returns
+/// nothing for half the corpus, which reads as "that conversation does not
+/// exist" rather than "I did not look there".
+///
+/// Discovery is by shape, not by a hardcoded list: any ~/.claude* directory
+/// with a projects/ subdirectory counts, so a new overlay is picked up without
+/// a code change. CLAUDE_CONFIG_DIR is honoured explicitly in case it points
+/// outside the home directory.
+fn claude_projects_dirs() -> Vec<PathBuf> {
+    config_roots(&CLAUDE, "projects")
+}
+
+/// Every Codex config root that holds a sessions/ tree: ~/.codex, ~/.codex-work
+/// and any other ~/.codex* overlay, plus $CODEX_HOME. Same account split, and
+/// the same silent "no matches" when only one root is read, as Claude.
+fn codex_sessions_dirs() -> Vec<PathBuf> {
+    config_roots(&CODEX, "sessions")
+}
+
+/// `$<env_var>/<subdir>`, `~/<default_root>/<subdir>`, then every sibling
+/// `~/<default_root>*/<subdir>` that is a directory, deduplicated, siblings sorted.
+fn config_roots(harness: &Harness, subdir: &str) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // Dedupe on the canonical path: a symlinked root (~/.claude-current ->
+    // ~/.claude) or a non-canonical CLAUDE_CONFIG_DIR would otherwise scan
+    // the same tree twice and print every hit twice.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut push = |dir: PathBuf| {
+        if dir.is_dir() && seen.insert(fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())) {
+            roots.push(dir);
+        }
+    };
+
+    if let Some(configured) = std::env::var_os(harness.env_var)
+        && !configured.is_empty()
+    {
+        let configured = PathBuf::from(configured);
+        push(
+            std::path::absolute(&configured)
+                .unwrap_or(configured)
+                .join(subdir),
+        );
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        push(home.join(harness.default_root).join(subdir));
+
+        if let Ok(entries) = fs::read_dir(&home) {
+            let mut siblings: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(harness.default_root))
+                })
+                .map(|path| path.join(subdir))
+                .filter(|path| path.is_dir())
+                .collect();
+            // read_dir order is filesystem-dependent; sort so results are
+            // reproducible across runs and machines.
+            siblings.sort();
+            for sibling in siblings {
+                push(sibling);
+            }
+        }
+    }
+
+    roots
+}
+
+/// Config root to pass as the harness's env var when resuming a session
+/// found under `sessions_dir` (projects/ or sessions/), or None if the
+/// harness already reads that root.
+///
+/// `claude -r` and `codex resume` only look in their own config root
+/// ($CLAUDE_CONFIG_DIR, else ~/.claude; $CODEX_HOME, else ~/.codex), so a
+/// session from any other root needs the override.
+fn resume_config_dir(harness: &Harness, sessions_dir: &Path) -> Option<PathBuf> {
+    let root = sessions_dir.parent()?;
+    let default = match std::env::var_os(harness.env_var) {
+        // The resume command cds into the project first, which would make a
+        // relative config dir point somewhere else; spell it out.
+        Some(dir) if !dir.is_empty() && Path::new(&dir).is_relative() => {
+            return Some(root.to_path_buf());
+        }
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => dirs::home_dir()?.join(harness.default_root),
+    };
+    let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canonical(root) == canonical(&default) {
+        None
+    } else {
+        Some(root.to_path_buf())
+    }
+}
+
+/// The copy-pasteable resume command printed under each Claude Code or Codex result
+fn resume_command(
+    harness: &Harness,
+    project_short: &str,
+    session_id: &str,
+    config_dir: Option<&Path>,
+) -> String {
+    let cd = match project_short.strip_prefix("~/") {
+        _ if project_short == "~" => "~".to_string(),
+        Some(rest) => format!("~/{}", shell_quote(rest)),
+        None => shell_quote(project_short),
+    };
+    let resume = harness.resume;
+    match config_dir {
+        Some(dir) => format!(
+            "cd {cd} && {}={} {resume} {}",
+            harness.env_var,
+            shell_path(dir),
+            shell_quote(session_id)
+        ),
+        None => format!("cd {cd} && {resume} {}", shell_quote(session_id)),
+    }
+}
+
+/// `s` as a single shell word, quoted only when it has to be
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// A path as a shell word that bash, zsh and fish all read back unchanged.
+/// Paths under the home directory use $HOME, which (unlike ~ after `=`)
+/// every one of those shells expands in a `VAR=value cmd` prefix.
+fn shell_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(home) = dirs::home_dir()
+        && let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref())
+        && rest.starts_with('/')
+    {
+        return format!("$HOME/{}", shell_quote(&rest[1..]));
+    }
+    shell_quote(&path)
+}
+
+/// Which config root owns a session found in several, given each root's
+/// (index, transcript length) for it: the longest copy, ties going to the
+/// earlier (higher-priority) root.
+///
+/// A backup or copied root (~/.claude.bak) holds copies of live sessions.
+/// Transcripts only grow, so a stale copy is never longer than the live
+/// one, and an identical copy defers to root priority. Modification time
+/// can't be used: `cp -r` gives the copy a newer one than the original.
+fn session_owner(copies: &[(usize, u64)]) -> Option<usize> {
+    copies
+        .iter()
+        .max_by(|(ra, la), (rb, lb)| la.cmp(lb).then(rb.cmp(ra)))
+        .map(|&(root, _)| root)
+}
+
+/// Owner of every session with a transcript in any config root, for deep
+/// search, which needs them before it searches.
+///
+/// Ownership never hides a match: it decides which root's hits are shown
+/// when several roots match the same session, and which root the Resume
+/// command targets, so resuming continues the live copy rather than a
+/// backup's. A session with a single transcript is owned by its root even
+/// if another root's stale index still lists it. Only sessions found in
+/// more than one root are stat'ed.
+fn session_owners(bases: &[PathBuf], project_filter: Option<&str>) -> HashMap<String, usize> {
+    if bases.len() < 2 {
+        return HashMap::new();
+    }
+    let mut copies: HashMap<String, Vec<(usize, PathBuf)>> = HashMap::new();
+    for (root, base) in bases.iter().enumerate() {
+        // Exactly the transcripts deep search reads (nested ones included,
+        // subagents excluded), within the dirs --project selects.
+        for path in resolve_search_paths(base, project_filter)
+            .iter()
+            .flat_map(|dir| find_jsonl_files(dir, true, false))
+        {
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            copies.entry(id.to_string()).or_default().push((root, path));
+        }
+    }
+    copies
+        .into_iter()
+        .filter_map(|(id, c)| {
+            let owner = if c.iter().all(|(root, _)| *root == c[0].0) {
+                Some(c[0].0)
+            } else {
+                let lens: Vec<(usize, u64)> = c
+                    .iter()
+                    .map(|(root, path)| (*root, fs::metadata(path).map_or(0, |m| m.len())))
+                    .collect();
+                session_owner(&lens)
+            };
+            owner.map(|root| (id, root))
+        })
+        .collect()
+}
+
+/// Owners of just the sessions index search matched. Each hit names its
+/// transcript, and a copied root keeps the same project dir name, so this
+/// checks that one path in every root instead of walking them all.
+fn index_owners(bases: &[PathBuf], hits: &[(usize, IndexMatch)]) -> HashMap<String, usize> {
+    if bases.len() < 2 {
+        return HashMap::new();
+    }
+    let mut owners = HashMap::new();
+    for (_, hit) in hits {
+        if owners.contains_key(&hit.session_id) {
+            continue;
+        }
+        let Some(project) = hit
+            .session_file
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+        else {
+            continue;
+        };
+        let file_name = format!("{}.jsonl", hit.session_id);
+        let copies: Vec<(usize, u64)> = bases
+            .iter()
+            .enumerate()
+            .filter_map(|(root, base)| {
+                fs::metadata(base.join(project).join(&file_name))
+                    .ok()
+                    .map(|m| (root, m.len()))
+            })
+            .collect();
+        if let Some(owner) = session_owner(&copies) {
+            owners.insert(hit.session_id.clone(), owner);
+        }
+    }
+    owners
+}
+
+/// Keep one root's hits per session: the owner's if the owner matched,
+/// otherwise the first root that did (a copy can hold a match the owner's
+/// copy doesn't). `retarget(hit, root, owner)` points each kept hit at the
+/// session's owner, which its Resume command targets.
+fn pick_session_hits<T>(
+    hits: Vec<(usize, T)>,
+    session_id: impl Fn(&T) -> &str,
+    owners: &HashMap<String, usize>,
+    retarget: impl Fn(&mut T, usize, usize),
+) -> Vec<(usize, T)> {
+    let mut shown: HashMap<String, usize> = HashMap::new();
+    for (root, hit) in &hits {
+        let id = session_id(hit);
+        let entry = shown.entry(id.to_string()).or_insert(*root);
+        if owners.get(id) == Some(root) {
+            *entry = *root;
+        }
+    }
+    hits.into_iter()
+        .filter(|(root, hit)| {
+            let id = session_id(hit);
+            id.is_empty() || shown.get(id) == Some(root)
+        })
+        .map(|(root, mut hit)| {
+            let owner = owners.get(session_id(&hit)).copied().unwrap_or(root);
+            retarget(&mut hit, root, owner);
+            (root, hit)
+        })
+        .collect()
 }
 
 fn openclaw_sessions_dir(agent: &str) -> PathBuf {
@@ -490,7 +846,7 @@ fn search_index(
                     } else {
                         entry.project_path.clone()
                     },
-                    first_prompt: truncate(&entry.first_prompt, MAX_SNIPPET_LEN),
+                    first_prompt: entry.first_prompt.clone(),
                     summary: entry.summary.clone(),
                     git_branch: entry.git_branch.clone(),
                     created: entry.created.clone(),
@@ -500,6 +856,8 @@ fn search_index(
                     score,
                     session_file: index_session_file(&index_path, &entry.session_id),
                     custom_title: None,
+                    config_root: config_root_for_projects(base),
+                    config_dir: None,
                 });
             }
         }
@@ -517,24 +875,40 @@ fn search_index(
 
 // ─── Deep Search ────────────────────────────────────────────────────
 
-fn resolve_search_path(base: &Path, project_filter: Option<&str>) -> PathBuf {
-    if let Some(filter) = project_filter {
-        let filter_lower = filter.to_lowercase();
-        if let Ok(entries) = fs::read_dir(base) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir()
-                    && entry
-                        .file_name()
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&filter_lower)
-                {
-                    return entry.path();
-                }
-            }
-        }
-    }
-    base.to_path_buf()
+/// Directories to search within one config root for a given --project filter.
+///
+/// Returns EVERY matching project directory, not the first. One project
+/// routinely has several encoded directories (a repo plus its worktrees, e.g.
+/// -home-user-myapp and
+/// -home-user-myapp--claude-worktrees-feature-x), and
+/// returning only the first hid whichever came later in readdir order.
+///
+/// An empty result means the filter matched nothing in THIS root, which is
+/// normal when a project lives only under another account. Callers skip the
+/// root rather than falling back to searching all of it, since that fallback
+/// silently widens a narrow query into a whole-account scan.
+fn resolve_search_paths(base: &Path, project_filter: Option<&str>) -> Vec<PathBuf> {
+    let Some(filter) = project_filter else {
+        return vec![base.to_path_buf()];
+    };
+
+    let filter_lower = filter.to_lowercase();
+    let mut paths: Vec<PathBuf> = match fs::read_dir(base) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_lowercase().contains(&filter_lower))
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // readdir order is filesystem-dependent; sort for reproducible results.
+    paths.sort();
+    paths
 }
 
 /// Extract text from Claude Code message format
@@ -725,15 +1099,33 @@ fn cached_custom_title(
 }
 
 /// Parse a single ripgrep output line: /path/to/file.jsonl:LINE_NUM:json_content
-fn parse_rg_line(line: &str) -> Option<(PathBuf, serde_json::Value)> {
+fn parse_rg_line(line: &str) -> Option<(PathBuf, usize, serde_json::Value)> {
     // Split on first two colons
     let first_colon = line.find(':')?;
     let path = PathBuf::from(&line[..first_colon]);
     let rest = &line[first_colon + 1..];
     let second_colon = rest.find(':')?;
+    let line_number = rest[..second_colon].parse().ok()?;
     let json_str = &rest[second_colon + 1..];
     let value = serde_json::from_str(json_str).ok()?;
-    Some((path, value))
+    Some((path, line_number, value))
+}
+
+fn config_root_for_projects(base: &Path) -> String {
+    base.parent().unwrap_or(base).to_string_lossy().into_owned()
+}
+
+fn record_uuid(record: &serde_json::Value) -> Option<String> {
+    record
+        .get("uuid")
+        .and_then(|value| value.as_str())
+        .map(String::from)
+}
+
+/// A path as a JSON string, lossily like the other path fields, so one
+/// non-UTF-8 name can't fail the whole row
+fn lossy_path<S: serde::Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+    path.as_deref().map(Path::to_string_lossy).serialize(s)
 }
 
 /// Extract session ID from file path (OpenClaw: filename is session ID)
@@ -951,17 +1343,27 @@ fn search_deep_claude_rust(
     project_filter: Option<&str>,
     base: &Path,
     date_range: &DateRange,
+    owned: &dyn Fn(&str) -> bool,
+    owns_any: bool,
 ) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
-    let search_path = resolve_search_path(base, project_filter);
+    let search_paths = resolve_search_paths(base, project_filter);
+    if search_paths.is_empty() {
+        return Vec::new();
+    }
     let query_terms_lower: Vec<String> =
         query.split_whitespace().map(|s| s.to_lowercase()).collect();
     let index_lookup = build_index_lookup(base);
 
-    let jsonl_files = find_jsonl_files(&search_path, true, false);
+    let jsonl_files: Vec<PathBuf> = search_paths
+        .iter()
+        .flat_map(|path| find_jsonl_files(path, true, false))
+        .collect();
 
     let mut matches = Vec::new();
+    let mut owned_hits = 0;
+    let mut unowned_hits = 0;
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
     let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
@@ -971,8 +1373,8 @@ fn search_deep_claude_rust(
         };
         let reader = BufReader::new(file);
 
-        for line in reader.lines() {
-            if matches.len() >= limit {
+        for (line_index, line) in reader.lines().enumerate() {
+            if owned_hits >= limit || (!owns_any && unowned_hits >= unowned_cap(limit)) {
                 break 'outer;
             }
 
@@ -994,6 +1396,12 @@ fn search_deep_claude_rust(
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+
+            let is_owned = owned(&session_id);
+
+            if !is_owned && unowned_hits >= unowned_cap(limit) {
+                continue;
+            }
 
             let count = seen_sessions.entry(session_id.clone()).or_insert(0);
             if *count >= MAX_MATCHES_PER_SESSION {
@@ -1038,11 +1446,22 @@ fn search_deep_claude_rust(
                 snippet,
                 timestamp,
                 summary: index_entry.map(|e| e.summary.clone()),
-                first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+                first_prompt: index_entry.map(|e| e.first_prompt.clone()),
                 custom_title: cached_custom_title(&mut titles, &file_path),
+                config_dir: None,
+                transcript_path: file_path.to_string_lossy().into_owned(),
+                config_root: Some(config_root_for_projects(base)),
+                sessions_root: None,
+                record_line: line_index + 1,
+                record_uuid: record_uuid(&record),
             });
 
             *count += 1;
+            if is_owned {
+                owned_hits += 1;
+            } else {
+                unowned_hits += 1;
+            }
         }
     }
 
@@ -1074,7 +1493,7 @@ fn search_deep_openclaw_rust(
         let reader = BufReader::new(file);
         let session_id = session_id_from_path(&file_path);
 
-        for line in reader.lines() {
+        for (line_index, line) in reader.lines().enumerate() {
             if matches.len() >= limit {
                 break 'outer;
             }
@@ -1140,6 +1559,12 @@ fn search_deep_openclaw_rust(
                 summary: None,
                 first_prompt: None,
                 custom_title: None,
+                config_dir: None,
+                transcript_path: file_path.to_string_lossy().into_owned(),
+                config_root: None,
+                sessions_root: Some(base.to_string_lossy().into_owned()),
+                record_line: line_index + 1,
+                record_uuid: record_uuid(&record),
             });
 
             *count += 1;
@@ -1149,19 +1574,43 @@ fn search_deep_openclaw_rust(
     matches
 }
 
+/// Most hits for sessions another root owns that one root's deep search keeps
+fn unowned_cap(limit: usize) -> usize {
+    limit.saturating_mul(MAX_MATCHES_PER_SESSION)
+}
+
+/// `owned` says whether this root owns a session ID. Hits for sessions owned
+/// by another config root are still returned, but don't count toward
+/// `limit`, so a backup's copies can't crowd out its own sessions. At most
+/// `unowned_cap(limit)` of them are kept; once that is reached a root that
+/// owns no sessions (`owns_any` false) stops early instead of being read end
+/// to end.
 fn search_deep_claude(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
     base: &Path,
     date_range: &DateRange,
+    owned: &dyn Fn(&str) -> bool,
+    owns_any: bool,
 ) -> Vec<DeepMatch> {
     // Check if ripgrep is available, fall back to pure Rust if not
     if !is_ripgrep_available() {
-        return search_deep_claude_rust(query, limit, project_filter, base, date_range);
+        return search_deep_claude_rust(
+            query,
+            limit,
+            project_filter,
+            base,
+            date_range,
+            owned,
+            owns_any,
+        );
     }
 
-    let search_path = resolve_search_path(base, project_filter);
+    let search_paths = resolve_search_paths(base, project_filter);
+    if search_paths.is_empty() {
+        return Vec::new();
+    }
     // Pre-lowercase query terms to avoid repeated allocations
     let query_terms_lower: Vec<String> =
         query.split_whitespace().map(|s| s.to_lowercase()).collect();
@@ -1180,7 +1629,7 @@ fn search_deep_claude(
             "!**/sessions-index.json",
             query,
         ])
-        .arg(&search_path)
+        .args(&search_paths)
         .output();
 
     let output = match output {
@@ -1188,7 +1637,15 @@ fn search_deep_claude(
         Err(e) => {
             // Fallback to Rust if ripgrep fails unexpectedly
             eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
-            return search_deep_claude_rust(query, limit, project_filter, base, date_range);
+            return search_deep_claude_rust(
+                query,
+                limit,
+                project_filter,
+                base,
+                date_range,
+                owned,
+                owns_any,
+            );
         }
     };
 
@@ -1203,15 +1660,17 @@ fn search_deep_claude(
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut matches = Vec::new();
+    let mut owned_hits = 0;
+    let mut unowned_hits = 0;
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
     let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for line in stdout.lines() {
-        if matches.len() >= limit {
+        if owned_hits >= limit || (!owns_any && unowned_hits >= unowned_cap(limit)) {
             break;
         }
 
-        let (path, record) = match parse_rg_line(line) {
+        let (path, record_line, record) = match parse_rg_line(line) {
             Some(r) => r,
             None => continue,
         };
@@ -1227,6 +1686,12 @@ fn search_deep_claude(
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string();
+
+        let is_owned = owned(&session_id);
+
+        if !is_owned && unowned_hits >= unowned_cap(limit) {
+            continue;
+        }
 
         let count = seen_sessions.entry(session_id.clone()).or_insert(0);
         if *count >= MAX_MATCHES_PER_SESSION {
@@ -1272,11 +1737,22 @@ fn search_deep_claude(
             snippet,
             timestamp,
             summary: index_entry.map(|e| e.summary.clone()),
-            first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+            first_prompt: index_entry.map(|e| e.first_prompt.clone()),
             custom_title: cached_custom_title(&mut titles, &path),
+            config_dir: None,
+            transcript_path: path.to_string_lossy().into_owned(),
+            config_root: Some(config_root_for_projects(base)),
+            sessions_root: None,
+            record_line,
+            record_uuid: record_uuid(&record),
         });
 
         *count += 1;
+        if is_owned {
+            owned_hits += 1;
+        } else {
+            unowned_hits += 1;
+        }
     }
 
     matches
@@ -1341,7 +1817,7 @@ fn search_deep_openclaw(
             break;
         }
 
-        let (path, record) = match parse_rg_line(line) {
+        let (path, record_line, record) = match parse_rg_line(line) {
             Some(r) => r,
             None => continue,
         };
@@ -1406,11 +1882,355 @@ fn search_deep_openclaw(
             summary: None,
             first_prompt: None,
             custom_title: None,
+            config_dir: None,
+            transcript_path: path.to_string_lossy().into_owned(),
+            config_root: None,
+            sessions_root: Some(base.to_string_lossy().into_owned()),
+            record_line,
+            record_uuid: record_uuid(&record),
         });
 
         *count += 1;
     }
 
+    matches
+}
+
+// ─── Codex Search ───────────────────────────────────────────────────
+
+/// How each piece of text Codex itself injects as user input begins, from
+/// the matchers in codex-rs/core/src/context/contextual_user_message.rs,
+/// plus `<user_instructions>`, which older rollouts used for AGENTS.md, and
+/// the labels Codex wraps around an attached image. Anything else a user
+/// item holds was typed or pasted, even when it starts with `<`.
+const CODEX_INJECTED_PREFIXES: &[&str] = &[
+    "# AGENTS.md instructions",
+    "<user_instructions>",
+    "<environment_context>",
+    "<skill>",
+    "<user_shell_command>",
+    "<turn_aborted>",
+    "<subagent_notification>",
+    "<agent_message_board_notification>",
+    "<codex_internal_context",
+    "<goal_context>",
+    "<recommended_plugins>",
+    "<hook_prompt",
+    "<image name=",
+    "<image>",
+    "</image>",
+];
+
+/// Text of a Codex conversation turn, or None for any other record.
+///
+/// Turns are `response_item` records whose payload is a user or assistant
+/// `message`. Developer messages and the harness text Codex injects as user
+/// items (CODEX_INJECTED_PREFIXES) are dropped, so a hit is something a
+/// person typed or the model answered. The `event_msg` copy of each prompt
+/// is ignored so a prompt is not counted twice.
+fn extract_text_codex(record: &serde_json::Value) -> Option<(String, String)> {
+    if record.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
+        return None;
+    }
+    let role = payload.get("role").and_then(|r| r.as_str())?;
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let text = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(|t| t.as_str()),
+                Some("input_text" | "output_text")
+            )
+        })
+        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+        .filter(|text| {
+            let text = text.trim_start();
+            role != "user"
+                || !CODEX_INJECTED_PREFIXES
+                    .iter()
+                    .any(|prefix| text.starts_with(prefix))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    Some((role.to_string(), text))
+}
+
+/// Read the session_meta record on the first line of a rollout.
+fn load_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    let mut first_line = String::new();
+    BufReader::new(File::open(path).ok()?)
+        .read_line(&mut first_line)
+        .ok()?;
+    let record: serde_json::Value = serde_json::from_str(&first_line).ok()?;
+    if record.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    let field = |name: &str| {
+        payload
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(CodexSessionMeta {
+        id: field("id"),
+        cwd: field("cwd"),
+        is_subagent: field("thread_source") == "subagent",
+    })
+}
+
+/// Thread names from `<codex home>/session_index.jsonl`. A rename appends a
+/// new line for the same id, so the last line wins.
+fn load_codex_thread_names(codex_home: &Path) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Ok(file) = File::open(codex_home.join("session_index.jsonl")) else {
+        return names;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let (Some(id), Some(name)) = (
+            entry.get("id").and_then(|v| v.as_str()),
+            entry.get("thread_name").and_then(|v| v.as_str()),
+        ) {
+            names.insert(id.to_string(), name.to_string());
+        }
+    }
+    names
+}
+
+/// The query term to hand ripgrep as a fixed string, or None to scan every
+/// rollout. A hit must contain every term, so one term is enough to find
+/// all candidate lines; the longest is usually the rarest. ripgrep reads the
+/// raw JSON line, so the term is JSON-escaped (a `"` in it is `\"` there).
+/// `CodexScan::consider` still checks every term against the parsed text.
+fn codex_prefilter_term(query: &str) -> Option<String> {
+    let term = query.split_whitespace().max_by_key(|term| term.len())?;
+    let escaped = serde_json::to_string(term).ok()?;
+    Some(escaped[1..escaped.len() - 1].to_string())
+}
+
+/// Codex session id when session_meta is unreadable: the UUID that ends
+/// `rollout-<timestamp>-<uuid>.jsonl`.
+fn codex_id_from_path(path: &Path) -> String {
+    let stem = session_id_from_path(path);
+    let start = stem.len().saturating_sub(36);
+    stem.get(start..).unwrap_or(&stem).to_string()
+}
+
+/// Turns ripgrep or fallback hits from one Codex root into DeepMatches.
+struct CodexScan<'a> {
+    query: &'a str,
+    terms: Vec<String>,
+    project_filter: Option<String>,
+    date_range: &'a DateRange,
+    codex_home: PathBuf,
+    /// CODEX_HOME for the resume command, when not the default home
+    config_dir: Option<PathBuf>,
+    thread_names: HashMap<String, String>,
+    metas: HashMap<PathBuf, Option<CodexSessionMeta>>,
+    per_session: HashMap<String, usize>,
+}
+
+impl<'a> CodexScan<'a> {
+    fn new(
+        query: &'a str,
+        project_filter: Option<&str>,
+        sessions_dir: &Path,
+        date_range: &'a DateRange,
+    ) -> Self {
+        let codex_home = sessions_dir.parent().unwrap_or(sessions_dir).to_path_buf();
+        Self {
+            query,
+            terms: query.split_whitespace().map(|s| s.to_lowercase()).collect(),
+            project_filter: project_filter.map(str::to_lowercase),
+            date_range,
+            thread_names: load_codex_thread_names(&codex_home),
+            codex_home,
+            config_dir: resume_config_dir(&CODEX, sessions_dir),
+            metas: HashMap::new(),
+            per_session: HashMap::new(),
+        }
+    }
+
+    fn consider(
+        &mut self,
+        path: &Path,
+        record_line: usize,
+        record: &serde_json::Value,
+    ) -> Option<DeepMatch> {
+        let (role, text) = extract_text_codex(record)?;
+        if !matches_all_terms(&text.to_lowercase(), &self.terms) {
+            return None;
+        }
+        let timestamp = record
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !self.date_range.contains(&timestamp) {
+            return None;
+        }
+
+        let meta = self
+            .metas
+            .entry(path.to_path_buf())
+            .or_insert_with(|| load_codex_session_meta(path));
+        // Subagent threads are the model talking to itself; Claude mode skips
+        // its subagents/ transcripts for the same reason.
+        if meta.as_ref().is_some_and(|m| m.is_subagent) {
+            return None;
+        }
+        let cwd = meta.as_ref().map(|m| m.cwd.clone()).unwrap_or_default();
+        if let Some(filter) = &self.project_filter
+            && !cwd.to_lowercase().contains(filter)
+        {
+            return None;
+        }
+        let session_id = meta
+            .as_ref()
+            .map(|m| m.id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| codex_id_from_path(path));
+
+        let count = self.per_session.entry(session_id.clone()).or_insert(0);
+        if *count >= MAX_MATCHES_PER_SESSION {
+            return None;
+        }
+        *count += 1;
+
+        Some(DeepMatch {
+            summary: self.thread_names.get(&session_id).cloned(),
+            session_id,
+            project_path: if cwd.is_empty() {
+                "unknown".to_string()
+            } else {
+                cwd
+            },
+            message_type: role,
+            snippet: get_snippet(&text, self.query, 80),
+            timestamp,
+            first_prompt: None,
+            custom_title: None,
+            config_dir: self.config_dir.clone(),
+            transcript_path: path.to_string_lossy().into_owned(),
+            config_root: Some(self.codex_home.to_string_lossy().into_owned()),
+            sessions_root: None,
+            record_line,
+            record_uuid: record_uuid(record),
+        })
+    }
+}
+
+/// Deep search one Codex sessions/ root, newest rollout first.
+///
+/// Rollouts live at YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl, so reverse
+/// path order is reverse chronological by thread start, and `limit` keeps
+/// the hits from the most recently started threads, not the most recent
+/// messages.
+fn search_deep_codex(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+    sessions_dir: &Path,
+    date_range: &DateRange,
+) -> Vec<DeepMatch> {
+    let mut scan = CodexScan::new(query, project_filter, sessions_dir, date_range);
+    let mut matches = Vec::new();
+
+    let rg_output = match codex_prefilter_term(query) {
+        Some(term) if is_ripgrep_available() => {
+            // --no-ignore: ~/.codex is commonly a git repo whose .gitignore is
+            // `*` (config versioned, transcripts not), and ripgrep would
+            // honour it and skip every rollout. --text: a rollout can hold a
+            // stray NUL byte, and ripgrep stops reading a file it takes for
+            // binary there, dropping every later hit the fallback finds.
+            Command::new("rg")
+                .args([
+                    "--no-heading",
+                    "--line-number",
+                    "--ignore-case",
+                    "--no-ignore",
+                    "--text",
+                    "--sortr=path",
+                    "--glob",
+                    "*.jsonl",
+                    "--fixed-strings",
+                    "-e",
+                    &term,
+                ])
+                .arg(sessions_dir)
+                .output()
+                .map_err(|e| eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback."))
+                .ok()
+                // Exit 1 is "no matches"; anything else may be a partial
+                // result, so scan without ripgrep instead
+                .filter(|output| match output.status.code() {
+                    Some(0 | 1) => true,
+                    code => {
+                        eprintln!(
+                            "WARNING: ripgrep returned unexpected exit code: {code:?}. Using Rust fallback."
+                        );
+                        false
+                    }
+                })
+        }
+        _ => {
+            if !is_ripgrep_available() {
+                warn_ripgrep_not_available();
+            }
+            None
+        }
+    };
+
+    if let Some(output) = rg_output {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if matches.len() >= limit {
+                break;
+            }
+            if let Some((path, record_line, record)) = parse_rg_line(line)
+                && let Some(hit) = scan.consider(&path, record_line, &record)
+            {
+                matches.push(hit);
+            }
+        }
+        return matches;
+    }
+
+    let mut files = find_jsonl_files(sessions_dir, false, false);
+    files.sort_by(|a, b| b.cmp(a));
+    'outer: for path in files {
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        for (line_index, line) in BufReader::new(file).lines().enumerate() {
+            if matches.len() >= limit {
+                break 'outer;
+            }
+            let Ok(line) = line else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(hit) = scan.consider(&path, line_index + 1, &record) {
+                matches.push(hit);
+            }
+        }
+    }
     matches
 }
 
@@ -1666,10 +2486,17 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
         }
         println!("      Session:  {}", m.session_id);
         // Print copy-pasteable resume command
-        println!(
-            "      Resume:   cd {} && claude -r {}",
-            project_short, m.session_id
-        );
+        if !m.session_id.is_empty() {
+            println!(
+                "      Resume:   {}",
+                resume_command(
+                    &CLAUDE,
+                    &project_short,
+                    &m.session_id,
+                    m.config_dir.as_deref()
+                )
+            );
+        }
         println!();
     }
 
@@ -1678,18 +2505,48 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
     println!("{sep}\n");
 }
 
-fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openclaw: bool) {
+/// One `--format jsonl` row: a result's fields plus `kind`, the mode that
+/// produced it, which tells a consumer which fields to expect
+#[derive(Serialize)]
+struct JsonlRow<'a, T> {
+    kind: &'static str,
+    #[serde(flatten)]
+    result: &'a T,
+}
+
+fn print_jsonl<T: Serialize>(kind: &'static str, matches: &[T], limit: usize) {
+    let mut out = std::io::stdout().lock();
+    for result in matches.iter().take(limit) {
+        let line = match serde_json::to_string(&JsonlRow { kind, result }) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("ERROR: failed to serialize search result: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = writeln!(out, "{line}").and_then(|()| out.flush()) {
+            // The reader closed the pipe (`| head -1`): it has what it wanted
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+            eprintln!("ERROR: failed to write search result: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, source: Source) {
     let total = matches.len();
     let displayed = &matches[..total.min(limit)];
 
     let sep = "=".repeat(60);
-    let source = if is_openclaw {
-        "OPENCLAW"
-    } else {
-        "CLAUDE CODE"
+    let source_name = match source {
+        Source::ClaudeCode => "CLAUDE CODE",
+        Source::Codex => "CODEX",
+        Source::OpenClaw => "OPENCLAW",
     };
     println!("\n{sep}");
-    println!("  DEEP SEARCH ({source}): \"{query}\"");
+    println!("  DEEP SEARCH ({source_name}): \"{query}\"");
     if total > limit {
         println!("  {total} matches found (showing top {limit})");
     } else {
@@ -1715,8 +2572,14 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
             .summary
             .as_deref()
             .filter(|s| !s.is_empty())
-            .or(m.first_prompt.as_deref().filter(|s| !s.is_empty()))
-            .unwrap_or("(no summary)");
+            .map(String::from)
+            .or_else(|| {
+                m.first_prompt
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|p| truncate(p, 120))
+            })
+            .unwrap_or_else(|| "(no summary)".to_string());
 
         println!("  [{}] [{}] {}", i + 1, role, label);
         if let Some(ref title) = m.custom_title {
@@ -1727,11 +2590,19 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
         let clean_snippet: String = m.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
         println!("      Snippet:  {clean_snippet}");
         println!("      Session:  {}", m.session_id);
-        // Print copy-pasteable resume command (Claude Code only, not OpenClaw)
-        if !is_openclaw && m.project_path != "unknown" {
+        // Print copy-pasteable resume command (Claude Code and Codex, not OpenClaw)
+        if let Some(harness) = source.harness()
+            && m.project_path != "unknown"
+            && !m.session_id.is_empty()
+        {
             println!(
-                "      Resume:   cd {} && claude -r {}",
-                project_short, m.session_id
+                "      Resume:   {}",
+                resume_command(
+                    harness,
+                    &project_short,
+                    &m.session_id,
+                    m.config_dir.as_deref()
+                )
             );
         }
         println!();
@@ -1816,7 +2687,11 @@ fn main() {
         }
 
         let matches = search_obsidian(&query, cli.limit, vault_path);
-        print_obsidian_results(&matches, &query, cli.limit, vault_path);
+        if matches!(cli.format, OutputFormat::Jsonl) {
+            print_jsonl("obsidian", &matches, cli.limit);
+        } else {
+            print_obsidian_results(&matches, &query, cli.limit, vault_path);
+        }
     } else if cli.openclaw {
         // OpenClaw mode
         let base = openclaw_sessions_dir(&cli.agent);
@@ -1835,32 +2710,190 @@ fn main() {
         }
 
         let matches = search_deep_openclaw(&query, cli.limit, &base, &date_range);
-        print_deep_results(&matches, &query, cli.limit, true);
-    } else {
-        // Claude Code mode
-        let base = claude_projects_dir();
-        if !base.exists() {
+        if matches!(cli.format, OutputFormat::Jsonl) {
+            print_jsonl("openclaw", &matches, cli.limit);
+        } else {
+            print_deep_results(&matches, &query, cli.limit, Source::OpenClaw);
+        }
+    } else if cli.codex {
+        // Codex mode. Deep search only: Codex keeps no searchable index.
+        let roots = codex_sessions_dirs();
+        if roots.is_empty() {
             eprintln!(
-                "ERROR: Claude projects directory not found: {}",
-                base.display()
+                "ERROR: no Codex sessions directory found under {} or $CODEX_HOME",
+                dirs::home_dir().unwrap_or_default().display()
             );
             std::process::exit(1);
         }
 
         let project_filter = cli.project.as_deref();
+        let mut matches: Vec<DeepMatch> = roots
+            .iter()
+            .flat_map(|root| {
+                search_deep_codex(&query, cli.limit, project_filter, root, &date_range)
+            })
+            .collect();
+        // Each root returned its newest hits. Unlike Claude deep hits, these
+        // carry a comparable key, so rank the merge by recency rather than
+        // round-robin: the newest hits win whichever account holds them.
+        matches.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        if matches!(cli.format, OutputFormat::Jsonl) {
+            print_jsonl("codex", &matches, cli.limit);
+        } else {
+            print_deep_results(&matches, &query, cli.limit, Source::Codex);
+        }
+    } else {
+        // Claude Code mode. Transcripts are split across config roots
+        // (~/.claude, ~/.claude-work, ...), so every root is searched and the
+        // results merged; searching only one silently hides whole accounts.
+        let bases = claude_projects_dirs();
+        if bases.is_empty() {
+            let pattern = dirs::home_dir()
+                .map(|h| h.join(".claude*").join("projects").display().to_string())
+                .unwrap_or_else(|| "~/.claude*/projects (home directory unknown)".to_string());
+            eprintln!(
+                "ERROR: no Claude projects directory found (looked in $CLAUDE_CONFIG_DIR/projects and {pattern})"
+            );
+            std::process::exit(1);
+        }
+
+        let project_filter = cli.project.as_deref();
+        let resume_dirs: Vec<Option<PathBuf>> = bases
+            .iter()
+            .map(|base| resume_config_dir(&CLAUDE, base))
+            .collect();
 
         if cli.deep {
-            let matches = search_deep_claude(&query, cli.limit, project_filter, &base, &date_range);
-            print_deep_results(&matches, &query, cli.limit, false);
+            let owners = session_owners(&bases, project_filter);
+            if let Some(filter) = project_filter
+                && bases
+                    .iter()
+                    .all(|base| resolve_search_paths(base, Some(filter)).is_empty())
+            {
+                eprintln!(
+                    "NOTE: --project {filter:?} matched no project directory in any config root."
+                );
+            }
+            let found: Vec<(usize, DeepMatch)> = bases
+                .iter()
+                .enumerate()
+                .flat_map(|(root, base)| {
+                    let owned = |id: &str| owners.get(id).is_none_or(|&owner| owner == root);
+                    let owns_any = owners.is_empty() || owners.values().any(|&o| o == root);
+                    search_deep_claude(
+                        &query,
+                        cli.limit,
+                        project_filter,
+                        base,
+                        &date_range,
+                        &owned,
+                        owns_any,
+                    )
+                    .into_iter()
+                    .map(move |hit| (root, hit))
+                })
+                .collect();
+            // Pick each session's hits before interleaving, so copies shown
+            // from another root don't take a root's turns in the round-robin.
+            // A root's own sessions go ahead of copies it shows for another
+            // root's sessions (the owner may simply have hit its --limit).
+            let mut own: Vec<Vec<DeepMatch>> = bases.iter().map(|_| Vec::new()).collect();
+            let mut copies: Vec<Vec<DeepMatch>> = bases.iter().map(|_| Vec::new()).collect();
+            for (root, hit) in pick_session_hits(
+                found,
+                |m| &m.session_id,
+                &owners,
+                |m, _, owner| {
+                    m.config_dir.clone_from(&resume_dirs[owner]);
+                    m.config_root = Some(config_root_for_projects(&bases[owner]));
+                },
+            ) {
+                match owners.get(&hit.session_id) {
+                    Some(&owner) if owner != root => copies[root].push(hit),
+                    _ => own[root].push(hit),
+                }
+            }
+            let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> = own
+                .into_iter()
+                .zip(copies)
+                .map(|(mut own, copies)| {
+                    own.extend(copies);
+                    own.into_iter()
+                })
+                .collect();
+            // Deep matches carry no comparable score (ripgrep returns file
+            // order), so a plain concatenation lets the first root consume the
+            // whole limit and hide every other account. Round-robin instead, so
+            // a low --limit shows a spread across accounts rather than only the
+            // alphabetically-first one.
+            let mut matches = Vec::new();
+            loop {
+                let mut progressed = false;
+                for hits in per_root.iter_mut() {
+                    if let Some(hit) = hits.next() {
+                        matches.push(hit);
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            if matches!(cli.format, OutputFormat::Jsonl) {
+                print_jsonl("deep", &matches, cli.limit);
+            } else {
+                print_deep_results(&matches, &query, cli.limit, Source::ClaudeCode);
+            }
         } else {
-            let mut matches = search_index(&query, project_filter, &base, &date_range);
+            let mut merged = Vec::new();
+            for (root, base) in bases.iter().enumerate() {
+                merged.extend(
+                    search_index(&query, project_filter, base, &date_range)
+                        .into_iter()
+                        .map(|m| (root, m)),
+                );
+            }
+            // Each root sorted its own results; re-sort so the merged list is
+            // ranked globally rather than grouped by which root it came from.
+            merged.sort_by(|(_, a), (_, b)| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.modified.cmp(&a.modified))
+            });
+            let owners = index_owners(&bases, &merged);
+            let mut matches: Vec<IndexMatch> = pick_session_hits(
+                merged,
+                |m| &m.session_id,
+                &owners,
+                |m, root, owner| {
+                    m.config_dir.clone_from(&resume_dirs[owner]);
+                    m.config_root = config_root_for_projects(&bases[owner]);
+                    // Read the custom title from the owner's transcript
+                    if owner != root
+                        && let Some(file) = &m.session_file
+                        && let Ok(rel) = file.strip_prefix(&bases[root])
+                    {
+                        m.session_file = Some(bases[owner].join(rel));
+                    }
+                },
+            )
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
             // Titles live in the transcripts, so only read them for displayed results
             for m in matches.iter_mut().take(cli.limit) {
+                // An index can list a session whose transcript is gone
+                m.session_file = m.session_file.take().filter(|path| path.is_file());
                 if let Some(path) = &m.session_file {
                     m.custom_title = read_custom_title(path);
                 }
             }
-            print_index_results(&matches, &query, cli.limit);
+            if matches!(cli.format, OutputFormat::Jsonl) {
+                print_jsonl("index", &matches, cli.limit);
+            } else {
+                print_index_results(&matches, &query, cli.limit);
+            }
         }
     }
 }

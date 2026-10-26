@@ -1,11 +1,11 @@
 ---
 name: search-sessions
-description: "Search across Claude Code and OpenClaw session history, plus Obsidian vaults. Use when you need to find past conversations, query sessions by date range, filter by project, search Obsidian notes, or resume previous sessions by UUID."
+description: "Search across Claude Code, Codex and OpenClaw session history, plus Obsidian vaults. Use when you need to find past conversations, query sessions by date range, filter by project, search Obsidian notes, or resume previous sessions by UUID."
 ---
 
 # search-sessions
 
-Fast CLI to search across all Claude Code and OpenClaw session history, plus Obsidian vaults. Find past decisions, code snippets, and resume any previous session.
+Fast CLI to search across all Claude Code, Codex and OpenClaw session history, plus Obsidian vaults. Find past decisions, code snippets, and resume any previous session.
 
 **Announce at start:** "I'm using search-sessions to find that in your session history."
 
@@ -50,6 +50,15 @@ search-sessions "bug" --date today
 search-sessions "refactor" --since "last week"
 ```
 
+### Codex Sessions
+
+Every `~/.codex*/sessions` root plus `$CODEX_HOME`, newest first. Always a deep search. `--project` matches the session's working directory.
+
+```bash
+search-sessions "helm upgrade" --codex
+search-sessions "acl" --codex --project myapp --since "3 days ago"
+```
+
 ### OpenClaw Sessions
 
 ```bash
@@ -78,6 +87,7 @@ claude --resume <session-uuid>
 | Flag | Description |
 |------|-------------|
 | `--deep` | Search full message content (slower) |
+| `--codex` | Search Codex sessions instead of Claude Code |
 | `--openclaw` | Search OpenClaw sessions instead of Claude Code |
 | `--obsidian PATH` | Search an Obsidian vault at the given path |
 | `--project FILTER` | Filter to projects matching substring |
