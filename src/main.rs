@@ -66,6 +66,7 @@ struct Cli {
 // ─── Data Structures ────────────────────────────────────────────────
 
 struct IndexMatch {
+    config_dir: Option<PathBuf>,
     session_id: String,
     project_path: String,
     first_prompt: String,
@@ -81,6 +82,7 @@ struct IndexMatch {
 }
 
 struct DeepMatch {
+    config_dir: Option<PathBuf>,
     session_id: String,
     project_path: String,
     message_type: String,
@@ -137,11 +139,41 @@ struct ObsidianMatch {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-fn claude_projects_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("Cannot determine home directory")
-        .join(".claude")
-        .join("projects")
+const DEFAULT_CONFIG_DIR: &str = ".claude";
+
+/// Every `~/.claude*` directory that holds a `projects/` folder, default profile first.
+fn claude_config_dirs() -> Vec<PathBuf> {
+    let home = dirs::home_dir().expect("Cannot determine home directory");
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(DEFAULT_CONFIG_DIR))
+        })
+        .filter(|path| path.join("projects").is_dir())
+        .collect();
+    dirs.sort_by_key(|path| (!is_default_config_dir(path), path.clone()));
+    dirs
+}
+
+fn is_default_config_dir(config_dir: &Path) -> bool {
+    config_dir
+        .file_name()
+        .is_some_and(|n| n == DEFAULT_CONFIG_DIR)
+}
+
+fn resume_command(config_dir: Option<&Path>, project: &str, session_id: &str) -> String {
+    let env = config_dir
+        .filter(|dir| !is_default_config_dir(dir))
+        .map(|dir| {
+            let shown = format_project_path(&dir.to_string_lossy());
+            format!("CLAUDE_CONFIG_DIR={shown} ")
+        })
+        .unwrap_or_default();
+    format!("cd {project} && {env}claude -r {session_id}")
 }
 
 fn openclaw_sessions_dir(agent: &str) -> PathBuf {
@@ -484,6 +516,7 @@ fn search_index(
                     }
                 }
                 matches.push(IndexMatch {
+                    config_dir: None,
                     session_id: entry.session_id.clone(),
                     project_path: if entry.project_path.is_empty() {
                         original_path.clone()
@@ -505,14 +538,17 @@ fn search_index(
         }
     }
 
+    sort_index_matches(&mut matches);
+    matches
+}
+
+fn sort_index_matches(matches: &mut [IndexMatch]) {
     matches.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.modified.cmp(&a.modified))
     });
-
-    matches
 }
 
 // ─── Deep Search ────────────────────────────────────────────────────
@@ -1032,6 +1068,7 @@ fn search_deep_claude_rust(
             }
 
             matches.push(DeepMatch {
+                config_dir: None,
                 session_id: session_id.clone(),
                 project_path,
                 message_type: record_type.to_string(),
@@ -1132,6 +1169,7 @@ fn search_deep_openclaw_rust(
             }
 
             matches.push(DeepMatch {
+                config_dir: None,
                 session_id: session_id.clone(),
                 project_path,
                 message_type: role,
@@ -1266,6 +1304,7 @@ fn search_deep_claude(
         }
 
         matches.push(DeepMatch {
+            config_dir: None,
             session_id: session_id.clone(),
             project_path,
             message_type: record_type.to_string(),
@@ -1398,6 +1437,7 @@ fn search_deep_openclaw(
             .unwrap_or_else(|| "unknown".to_string());
 
         matches.push(DeepMatch {
+            config_dir: None,
             session_id: session_id.clone(),
             project_path,
             message_type: role,
@@ -1667,8 +1707,8 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
         println!("      Session:  {}", m.session_id);
         // Print copy-pasteable resume command
         println!(
-            "      Resume:   cd {} && claude -r {}",
-            project_short, m.session_id
+            "      Resume:   {}",
+            resume_command(m.config_dir.as_deref(), &project_short, &m.session_id)
         );
         println!();
     }
@@ -1730,8 +1770,8 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
         // Print copy-pasteable resume command (Claude Code only, not OpenClaw)
         if !is_openclaw && m.project_path != "unknown" {
             println!(
-                "      Resume:   cd {} && claude -r {}",
-                project_short, m.session_id
+                "      Resume:   {}",
+                resume_command(m.config_dir.as_deref(), &project_short, &m.session_id)
             );
         }
         println!();
@@ -1838,11 +1878,10 @@ fn main() {
         print_deep_results(&matches, &query, cli.limit, true);
     } else {
         // Claude Code mode
-        let base = claude_projects_dir();
-        if !base.exists() {
+        let config_dirs = claude_config_dirs();
+        if config_dirs.is_empty() {
             eprintln!(
-                "ERROR: Claude projects directory not found: {}",
-                base.display()
+                "ERROR: No Claude projects directory found under ~/{DEFAULT_CONFIG_DIR}*/projects"
             );
             std::process::exit(1);
         }
@@ -1850,10 +1889,28 @@ fn main() {
         let project_filter = cli.project.as_deref();
 
         if cli.deep {
-            let matches = search_deep_claude(&query, cli.limit, project_filter, &base, &date_range);
+            let mut matches = Vec::new();
+            for config_dir in &config_dirs {
+                let base = config_dir.join("projects");
+                let mut found =
+                    search_deep_claude(&query, cli.limit, project_filter, &base, &date_range);
+                found
+                    .iter_mut()
+                    .for_each(|m| m.config_dir = Some(config_dir.clone()));
+                matches.extend(found);
+            }
             print_deep_results(&matches, &query, cli.limit, false);
         } else {
-            let mut matches = search_index(&query, project_filter, &base, &date_range);
+            let mut matches = Vec::new();
+            for config_dir in &config_dirs {
+                let base = config_dir.join("projects");
+                let mut found = search_index(&query, project_filter, &base, &date_range);
+                found
+                    .iter_mut()
+                    .for_each(|m| m.config_dir = Some(config_dir.clone()));
+                matches.extend(found);
+            }
+            sort_index_matches(&mut matches);
             // Titles live in the transcripts, so only read them for displayed results
             for m in matches.iter_mut().take(cli.limit) {
                 if let Some(path) = &m.session_file {
