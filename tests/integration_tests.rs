@@ -703,3 +703,119 @@ mod custom_title_cli {
         );
     }
 }
+
+mod config_profiles {
+    use super::*;
+    use std::path::Path;
+
+    const ALT_PROJECT: &str = "-home-user-projects-quasar";
+
+    fn session_line(session_id: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": "/home/user/projects/quasar",
+            "timestamp": "2026-03-03T09:00:00Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        })
+        .to_string()
+    }
+
+    fn write_profile(home: &Path, profile: &str, session_id: &str, summary: &str) {
+        let project = home.join(profile).join("projects").join(ALT_PROJECT);
+        fs::create_dir_all(&project).unwrap();
+        let index = serde_json::json!({
+            "originalPath": "/home/user/projects/quasar",
+            "entries": [{
+                "sessionId": session_id,
+                "firstPrompt": "quasar",
+                "summary": summary,
+                "messageCount": 1,
+                "created": "2026-03-03T09:00:00Z",
+                "modified": "2026-03-03T09:00:00Z",
+                "gitBranch": "main",
+                "projectPath": "/home/user/projects/quasar"
+            }],
+        });
+        fs::write(project.join("sessions-index.json"), index.to_string()).unwrap();
+        fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            session_line(session_id, &format!("quasar pulse {summary}")),
+        )
+        .unwrap();
+    }
+
+    fn two_profile_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        write_profile(home.path(), ".claude", "default-session", "default quasar");
+        write_profile(home.path(), ".claude-alt", "alt-session", "alt quasar");
+        fs::create_dir_all(home.path().join(".claude-mem/notprojects")).unwrap();
+        home
+    }
+
+    fn run(home: &Path, args: &[&str]) -> String {
+        ensure_binary_built();
+        let output = Command::new(binary_path())
+            .args(args)
+            .env("HOME", home)
+            .output()
+            .expect("Failed to run binary");
+        assert!(output.status.success(), "binary failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn test_index_search_covers_every_profile() {
+        let home = two_profile_home();
+        let stdout = run(home.path(), &["quasar"]);
+
+        assert!(stdout.contains("2 matches found"), "got: {stdout}");
+        assert!(stdout.contains("alt-session"), "got: {stdout}");
+        assert!(stdout.contains("default-session"), "got: {stdout}");
+    }
+
+    #[test]
+    fn test_deep_search_covers_every_profile() {
+        let home = two_profile_home();
+        let stdout = run(home.path(), &["--deep", "pulse"]);
+
+        assert!(stdout.contains("2 matches found"), "got: {stdout}");
+        assert!(stdout.contains("alt-session"), "got: {stdout}");
+        assert!(stdout.contains("default-session"), "got: {stdout}");
+    }
+
+    #[test]
+    fn test_resume_names_the_profile_only_when_not_default() {
+        let home = two_profile_home();
+        for args in [&["quasar"][..], &["--deep", "pulse"][..]] {
+            let stdout = run(home.path(), args);
+            let resume = |id: &str| {
+                stdout
+                    .lines()
+                    .find(|l| l.contains("Resume:") && l.contains(id))
+                    .unwrap_or_else(|| panic!("no resume line for {id} in: {stdout}"))
+                    .to_string()
+            };
+
+            assert!(
+                resume("alt-session").contains("CLAUDE_CONFIG_DIR=~/.claude-alt claude -r"),
+                "got: {stdout}"
+            );
+            assert!(
+                !resume("default-session").contains("CLAUDE_CONFIG_DIR"),
+                "got: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_without_projects_is_not_a_profile() {
+        let home = tempfile::tempdir().unwrap();
+        write_profile(home.path(), ".claude", "default-session", "default quasar");
+        fs::create_dir_all(home.path().join(".claude-mem/data")).unwrap();
+
+        let stdout = run(home.path(), &["quasar"]);
+
+        assert!(stdout.contains("1 matches found"), "got: {stdout}");
+    }
+}

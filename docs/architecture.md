@@ -18,6 +18,14 @@ Claude Code stores session data in `~/.claude/projects/`:
 - **`sessions-index.json`**: Small JSON files with session metadata — `summary`, `firstPrompt`, `created`, `modified`, `gitBranch`, `projectPath`, `messageCount`
 - **`*.jsonl`**: One JSON record per line — user messages, assistant responses, tool calls, file snapshots
 
+### Multiple config directories
+
+search-sessions searches every `~/.claude*` directory that contains a `projects/` folder, so a second profile (`CLAUDE_CONFIG_DIR=~/.claude-work`) appears next to the default one. A result from a non-default profile prints a `Resume:` line that sets `CLAUDE_CONFIG_DIR`, because `claude -r` only finds a session inside the profile that wrote it.
+
+```
+Resume:   cd ~/Projects/myapp && CLAUDE_CONFIG_DIR=~/.claude-work claude -r 7897c935-...
+```
+
 ## Search architecture
 
 **Index search** (pure Rust): 
